@@ -120,7 +120,7 @@ from lerobot.teleoperators import (  # noqa: F401
     so_leader,
     unitree_g1,
 )
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -396,6 +396,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         else:
             # Create empty dataset or load existing saved episodes
             sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
+            dataset_root = Path(cfg.dataset.root) if cfg.dataset.root else HF_LEROBOT_HOME / cfg.dataset.repo_id
+            if dataset_root.exists():
+                import shutil
+                logging.warning("Removing existing dataset at %s (not in resume mode).", dataset_root)
+                shutil.rmtree(dataset_root)
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,
                 cfg.dataset.fps,
