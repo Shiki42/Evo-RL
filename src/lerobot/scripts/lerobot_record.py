@@ -102,10 +102,9 @@ from lerobot.robots import (  # noqa: F401
 from lerobot.scripts.recording_hil import (
     ACPInferenceConfig,
     PolicySyncDualArmExecutor,
-    _capture_policy_runtime_state,  # noqa: F401
-    _predict_policy_action_with_acp_inference,  # noqa: F401
 )
 from lerobot.scripts.recording_loop import record_loop
+from lerobot.scripts.takeover_modes import make_takeover_mode
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_openarm_leader,
@@ -239,6 +238,22 @@ class RecordConfig:
     communication_retry_timeout_s: float = 2.0
     # Sleep interval between communication retries (seconds).
     communication_retry_interval_s: float = 0.1
+    # Takeover mode: 'joint_coupled' (default, current behavior) or 'ee_delta_ik'
+    takeover_mode: str = "joint_coupled"
+    # URDF path for leader FK (required for ee_delta_ik mode)
+    takeover_leader_urdf: str | None = None
+    # URDF path for follower FK+IK (required for ee_delta_ik mode)
+    takeover_follower_urdf: str | None = None
+    # End-effector frame name in URDF
+    takeover_ee_frame: str = "gripper_frame_link"
+    # Motor names for FK/IK (required for ee_delta_ik mode)
+    takeover_motor_names: list[str] | None = None
+    # Max Cartesian step per cycle (meters)
+    takeover_max_ee_step_m: float = 0.05
+    # Workspace lower bounds [x,y,z] (optional)
+    takeover_ee_bounds_min: list[float] | None = None
+    # Workspace upper bounds [x,y,z] (optional)
+    takeover_ee_bounds_max: list[float] | None = None
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -288,6 +303,10 @@ class RecordConfig:
             raise ValueError("`communication_retry_timeout_s` must be >= 0.")
         if self.communication_retry_interval_s <= 0:
             raise ValueError("`communication_retry_interval_s` must be > 0.")
+        if self.takeover_mode not in ("joint_coupled", "ee_delta_ik"):
+            raise ValueError(
+                f"`takeover_mode` must be 'joint_coupled' or 'ee_delta_ik', got {self.takeover_mode!r}."
+            )
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -421,6 +440,23 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if callable(on_record_connected):
             on_record_connected(robot, teleop)
 
+        # Construct takeover mode handler
+        motor_names = cfg.takeover_motor_names
+        if motor_names is None and cfg.takeover_mode != "joint_coupled":
+            motor_names = [
+                k.removesuffix(".pos") for k in robot.action_features if k.endswith(".pos")
+            ]
+        takeover_handler = make_takeover_mode(
+            mode=cfg.takeover_mode,
+            leader_urdf=cfg.takeover_leader_urdf,
+            follower_urdf=cfg.takeover_follower_urdf,
+            ee_frame=cfg.takeover_ee_frame,
+            motor_names=motor_names,
+            max_ee_step_m=cfg.takeover_max_ee_step_m,
+            ee_bounds_min=cfg.takeover_ee_bounds_min,
+            ee_bounds_max=cfg.takeover_ee_bounds_max,
+        )
+
         if cfg.policy_sync_to_teleop:
             if cfg.policy is None:
                 raise ValueError("`policy_sync_to_teleop=true` requires `policy` to be set.")
@@ -468,6 +504,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     acp_inference=cfg.acp_inference,
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
+                    takeover_mode=takeover_handler,
                 )
 
                 episode_success = None
@@ -517,6 +554,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         acp_inference=cfg.acp_inference,
                         communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                         communication_retry_interval_s=cfg.communication_retry_interval_s,
+                        takeover_mode=takeover_handler,
                     )
 
                 if events["rerecord_episode"]:

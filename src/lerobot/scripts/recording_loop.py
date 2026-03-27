@@ -43,6 +43,7 @@ from lerobot.scripts.recording_hil import (
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
 )
+from lerobot.scripts.takeover_modes import TakeoverMode
 from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -52,6 +53,97 @@ from lerobot.utils.utils import get_safe_torch_device
 from lerobot.utils.visualization_utils import log_rerun_data
 
 T = TypeVar("T")
+
+
+def _resolve_intervention_action(
+    act_processed_teleop: RobotAction | None,
+    last_intervention_action: RobotAction | None,
+    act_processed_policy: RobotAction | None,
+    zero_policy_action: RobotAction,
+    obs_processed: RobotObservation,
+    takeover_mode: TakeoverMode | None,
+    takeover_entered: bool,
+    teleop_fallback_warned: bool,
+) -> tuple[RobotAction, bool]:
+    """Pick the action during an active intervention (S1).
+
+    Returns (action_values, teleop_fallback_warned).
+    """
+    if act_processed_teleop is not None:
+        action = (
+            takeover_mode.compute_action(act_processed_teleop, obs_processed)
+            if takeover_entered and takeover_mode is not None
+            else act_processed_teleop
+        )
+        return action, teleop_fallback_warned
+
+    # No fresh teleop data — use cached takeover output (already IK-processed)
+    if last_intervention_action is not None:
+        if not teleop_fallback_warned:
+            logging.warning(
+                "Intervention is active but no fresh teleop action is available; reusing last takeover output."
+            )
+        return last_intervention_action, True
+
+    if act_processed_policy is not None:
+        if not teleop_fallback_warned:
+            logging.warning(
+                "Intervention is active but teleop action is unavailable; falling back to policy action."
+            )
+        return act_processed_policy, True
+
+    if not teleop_fallback_warned:
+        logging.warning(
+            "Intervention is active but no teleop/policy action is available; sending zero action."
+        )
+    return zero_policy_action, True
+
+
+def _run_with_connection_retry(
+    action_name: str,
+    fn: Callable[[], T],
+    timeout_s: float,
+    interval_s: float,
+) -> T:
+    """Call *fn* with automatic retries on transient ``ConnectionError``."""
+    timeout_s = max(timeout_s, 0.0)
+    interval_s = max(interval_s, 0.0)
+    deadline_t = time.perf_counter() + timeout_s
+    attempts = 0
+    first_error: ConnectionError | None = None
+
+    while True:
+        attempts += 1
+        try:
+            result = fn()
+            if attempts > 1:
+                elapsed_s = timeout_s - max(deadline_t - time.perf_counter(), 0.0)
+                logging.warning(
+                    "%s recovered after %d retries in %.2fs.",
+                    action_name,
+                    attempts - 1,
+                    elapsed_s,
+                )
+            return result
+        except ConnectionError as error:
+            if first_error is None:
+                first_error = error
+                logging.warning(
+                    "%s failed with transient communication error; retrying for up to %.2fs (%s)",
+                    action_name,
+                    timeout_s,
+                    error,
+                )
+
+            if timeout_s <= 0.0:
+                raise
+
+            remaining_s = deadline_t - time.perf_counter()
+            if remaining_s <= 0.0:
+                raise
+
+            sleep_s = interval_s if interval_s > 0.0 else remaining_s
+            time.sleep(min(sleep_s, remaining_s))
 
 
 """ --------------- record_loop() data flow --------------------------
@@ -114,6 +206,7 @@ def record_loop(
     acp_inference: ACPInferenceConfig | None = None,
     communication_retry_timeout_s: float = 2.0,
     communication_retry_interval_s: float = 0.1,
+    takeover_mode: TakeoverMode | None = None,
 ):
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
@@ -159,9 +252,10 @@ def record_loop(
     has_teleop = isinstance(teleop, (Teleoperator, list))
     intervention_enabled = intervention_state_machine_enabled and policy is not None and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY
-    last_teleop_action: RobotAction | None = None
+    last_intervention_action: RobotAction | None = None
     teleop_fallback_warned = False
 
+    takeover_entered = takeover_mode is None  # True when on_enter was called or not needed
     teleop_arm_for_mode_switch: Any | None = None
     if isinstance(teleop, Teleoperator):
         teleop_arm_for_mode_switch = teleop
@@ -173,10 +267,7 @@ def record_loop(
             return
         if not hasattr(teleop_arm_for_mode_switch, "set_manual_control"):
             return
-        try:
-            teleop_arm_for_mode_switch.set_manual_control(enabled)
-        except Exception:
-            logging.exception("Failed to switch teleop manual-control mode to %s", enabled)
+        teleop_arm_for_mode_switch.set_manual_control(enabled)
 
     if policy is None:
         # During reset/teleop-only loops keep leader backdrivable for manual dragging.
@@ -198,45 +289,10 @@ def record_loop(
         # Start in S0: policy drives both arms, teleop arm should accept feedback commands.
         set_teleop_manual_control(False)
 
-    def run_with_connection_retry(action_name: str, fn: Callable[[], T]) -> T:
-        timeout_s = max(communication_retry_timeout_s, 0.0)
-        interval_s = max(communication_retry_interval_s, 0.0)
-        deadline_t = time.perf_counter() + timeout_s
-        attempts = 0
-        first_error: ConnectionError | None = None
-
-        while True:
-            attempts += 1
-            try:
-                result = fn()
-                if attempts > 1:
-                    elapsed_s = timeout_s - max(deadline_t - time.perf_counter(), 0.0)
-                    logging.warning(
-                        "%s recovered after %d retries in %.2fs.",
-                        action_name,
-                        attempts - 1,
-                        elapsed_s,
-                    )
-                return result
-            except ConnectionError as error:
-                if first_error is None:
-                    first_error = error
-                    logging.warning(
-                        "%s failed with transient communication error; retrying for up to %.2fs (%s)",
-                        action_name,
-                        timeout_s,
-                        error,
-                    )
-
-                if timeout_s <= 0.0:
-                    raise
-
-                remaining_s = deadline_t - time.perf_counter()
-                if remaining_s <= 0.0:
-                    raise
-
-                sleep_s = interval_s if interval_s > 0.0 else remaining_s
-                time.sleep(min(sleep_s, remaining_s))
+    def retry(action_name: str, fn: Callable[[], T]) -> T:
+        return _run_with_connection_retry(
+            action_name, fn, communication_retry_timeout_s, communication_retry_interval_s
+        )
 
     timestamp = 0
     start_episode_t = time.perf_counter()
@@ -253,9 +309,13 @@ def record_loop(
                 if intervention_state == INTERVENTION_STATE_POLICY:
                     intervention_state = INTERVENTION_STATE_ACTIVE
                     set_teleop_manual_control(True)
+                    takeover_entered = takeover_mode is None
                     logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
                 else:
                     intervention_state = INTERVENTION_STATE_RELEASE
+                    if takeover_mode is not None and takeover_entered:
+                        takeover_mode.on_exit()
+                    takeover_entered = False
                     set_teleop_manual_control(False)
                     if policy is not None and preprocessor is not None and postprocessor is not None:
                         policy.reset()
@@ -264,7 +324,6 @@ def record_loop(
                         if acp_inference.enable and acp_inference.use_cfg:
                             cond_policy_runtime_state = _capture_policy_runtime_state(policy)
                             uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
-                    if policy is not None and preprocessor is not None and postprocessor is not None:
                         logging.info("Policy cache reset on release: next policy action is recomputed.")
                     logging.info("Intervention release requested (S2): returning control to policy.")
             else:
@@ -304,13 +363,13 @@ def record_loop(
             act_processed_policy = make_robot_action(policy_action, dataset.features)
 
         if isinstance(teleop, Teleoperator):
-            act = run_with_connection_retry("teleop.get_action", teleop.get_action)
+            act = retry("teleop.get_action", teleop.get_action)
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
 
         elif isinstance(teleop, list):
-            arm_action = run_with_connection_retry("teleop_arm.get_action", teleop_arm.get_action)
+            arm_action = retry("teleop_arm.get_action", teleop_arm.get_action)
             arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
             keyboard_action = teleop_keyboard.get_action()
             base_action = robot._from_keyboard_to_base_action(keyboard_action)
@@ -326,7 +385,6 @@ def record_loop(
             continue
 
         if act_processed_teleop is not None:
-            last_teleop_action = act_processed_teleop
             teleop_fallback_warned = False
 
         policy_action_for_storage = (
@@ -336,29 +394,21 @@ def record_loop(
         is_intervention = 0.0
         if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
             is_intervention = 1.0
+            if not takeover_entered and act_processed_teleop is not None:
+                takeover_mode.on_enter(act_processed_teleop, obs_processed)
+                takeover_entered = True
+            action_values, teleop_fallback_warned = _resolve_intervention_action(
+                act_processed_teleop=act_processed_teleop,
+                last_intervention_action=last_intervention_action,
+                act_processed_policy=act_processed_policy,
+                zero_policy_action=zero_policy_action,
+                obs_processed=obs_processed,
+                takeover_mode=takeover_mode,
+                takeover_entered=takeover_entered,
+                teleop_fallback_warned=teleop_fallback_warned,
+            )
             if act_processed_teleop is not None:
-                action_values = act_processed_teleop
-            elif last_teleop_action is not None:
-                action_values = last_teleop_action
-                if not teleop_fallback_warned:
-                    logging.warning(
-                        "Intervention is active but no fresh teleop action is available; reusing last teleop action."
-                    )
-                    teleop_fallback_warned = True
-            elif act_processed_policy is not None:
-                action_values = act_processed_policy
-                if not teleop_fallback_warned:
-                    logging.warning(
-                        "Intervention is active but teleop action is unavailable; falling back to policy action."
-                    )
-                    teleop_fallback_warned = True
-            else:
-                action_values = zero_policy_action
-                if not teleop_fallback_warned:
-                    logging.warning(
-                        "Intervention is active but no teleop/policy action is available; sending zero action."
-                    )
-                    teleop_fallback_warned = True
+                last_intervention_action = action_values
         else:
             action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
 
@@ -371,14 +421,14 @@ def record_loop(
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         selected_from_policy = act_processed_policy is not None and action_values is act_processed_policy
         if policy_sync_executor is not None and selected_from_policy:
-            _sent_action = run_with_connection_retry(
+            _sent_action = retry(
                 "policy_sync_executor.send_action",
                 lambda robot_action_to_send=robot_action_to_send: policy_sync_executor.send_action(
                     robot_action_to_send
                 ),
             )
         else:
-            _sent_action = run_with_connection_retry(
+            _sent_action = retry(
                 "robot.send_action",
                 lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
             )
