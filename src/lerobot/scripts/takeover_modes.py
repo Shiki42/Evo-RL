@@ -169,27 +169,34 @@ class EEDeltaIKTakeover(TakeoverMode):
         return target
 
     def _solve_ik(self, follower_obs: RobotObservation, target: np.ndarray) -> np.ndarray:
-        # Use last IK solution as initial guess for solver stability (Test 2 pattern).
-        # Falls back to live joint positions only on first call after on_enter.
-        initial_guess = self._last_safe_q
+        # Use last IK solution as initial guess for solver continuity.
         q_result = self.follower_kin.inverse_kinematics(
-            initial_guess, target, orientation_weight=self.ik_orientation_weight
+            self._last_safe_q, target, orientation_weight=self.ik_orientation_weight
         )
 
-        # Validate IK solution via FK roundtrip (placo solver always returns a result
-        # but may not converge; this check catches divergent solutions)
         fk_check = self.follower_kin.forward_kinematics(q_result)
         pos_err = float(np.linalg.norm(fk_check[:3, 3] - target[:3, 3]))
-        if pos_err > self.ik_pos_tolerance_m:
-            logging.warning(
-                "IK roundtrip error %.4fm exceeds tolerance %.4fm; holding last safe joints.",
-                pos_err,
-                self.ik_pos_tolerance_m,
-            )
-            return self._last_safe_q
 
-        self._last_safe_q = q_result.copy()
-        return q_result
+        if pos_err <= self.ik_pos_tolerance_m:
+            self._last_safe_q = q_result.copy()
+            return q_result
+
+        # First attempt failed — retry with current real joint positions as seed.
+        follower_q = _extract_joint_array(follower_obs, self.motor_names)
+        q_retry = self.follower_kin.inverse_kinematics(
+            follower_q, target, orientation_weight=self.ik_orientation_weight
+        )
+        fk_retry = self.follower_kin.forward_kinematics(q_retry)
+        retry_err = float(np.linalg.norm(fk_retry[:3, 3] - target[:3, 3]))
+
+        if retry_err < pos_err:
+            self._last_safe_q = q_retry.copy()
+            if retry_err > self.ik_pos_tolerance_m:
+                logging.warning("IK retry improved %.4fm -> %.4fm but still above tolerance.", pos_err, retry_err)
+            return q_retry
+
+        logging.warning("IK error %.4fm; holding last safe joints.", pos_err)
+        return self._last_safe_q
 
     def _build_action_dict(self, joint_result: np.ndarray, leader_action: RobotAction) -> RobotAction:
         action: RobotAction = {}
