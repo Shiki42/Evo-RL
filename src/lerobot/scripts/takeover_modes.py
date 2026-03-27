@@ -101,7 +101,8 @@ class EEDeltaIKTakeover(TakeoverMode):
         ee_bounds_min: list[float] | None = None,
         ee_bounds_max: list[float] | None = None,
         deadband_m: float = 0.0005,
-        ik_pos_tolerance_m: float = 0.01,
+        ik_pos_tolerance_m: float = 0.02,
+        ik_orientation_weight: float = 0.001,
     ):
         self.leader_kin = leader_kinematics
         self.follower_kin = follower_kinematics
@@ -111,6 +112,7 @@ class EEDeltaIKTakeover(TakeoverMode):
         self.ee_bounds_max = np.array(ee_bounds_max, dtype=float) if ee_bounds_max is not None else None
         self.deadband_m = deadband_m
         self.ik_pos_tolerance_m = ik_pos_tolerance_m
+        self.ik_orientation_weight = ik_orientation_weight
 
         self._leader_ref: np.ndarray | None = None
         self._follower_ref: np.ndarray | None = None
@@ -168,7 +170,9 @@ class EEDeltaIKTakeover(TakeoverMode):
 
     def _solve_ik(self, follower_obs: RobotObservation, target: np.ndarray) -> np.ndarray:
         follower_q = _extract_joint_array(follower_obs, self.motor_names)
-        q_result = self.follower_kin.inverse_kinematics(follower_q, target)
+        q_result = self.follower_kin.inverse_kinematics(
+            follower_q, target, orientation_weight=self.ik_orientation_weight
+        )
 
         # Validate IK solution via FK roundtrip (placo solver always returns a result
         # but may not converge; this check catches divergent solutions)
@@ -210,7 +214,8 @@ def make_takeover_mode(
     ee_bounds_min: list[float] | None = None,
     ee_bounds_max: list[float] | None = None,
     deadband_m: float = 0.0005,
-    ik_pos_tolerance_m: float = 0.01,
+    ik_pos_tolerance_m: float = 0.02,
+    ik_orientation_weight: float = 0.001,
 ) -> TakeoverMode:
     """Instantiate a TakeoverMode by name.
 
@@ -237,6 +242,7 @@ def make_takeover_mode(
             ee_bounds_max=ee_bounds_max,
             deadband_m=deadband_m,
             ik_pos_tolerance_m=ik_pos_tolerance_m,
+            ik_orientation_weight=ik_orientation_weight,
         )
 
     raise ValueError(f"Unknown takeover mode: {mode!r}. Expected 'joint_coupled' or 'ee_delta_ik'.")
