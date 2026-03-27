@@ -409,6 +409,12 @@ def record_loop(
             )
             if act_processed_teleop is not None:
                 last_intervention_action = action_values
+        elif takeover_mode is not None and act_processed_teleop is not None and policy is None:
+            # Pure teleop with takeover mode: apply FK-delta-IK on every tick
+            if not takeover_entered:
+                takeover_mode.on_enter(act_processed_teleop, obs_processed)
+                takeover_entered = True
+            action_values = takeover_mode.compute_action(act_processed_teleop, obs_processed)
         else:
             action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
 
