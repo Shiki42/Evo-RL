@@ -102,7 +102,7 @@ class EEDeltaIKTakeover(TakeoverMode):
         ee_bounds_max: list[float] | None = None,
         deadband_m: float = 0.0005,
         ik_pos_tolerance_m: float = 0.02,
-        ik_orientation_weight: float = 0.001,
+        ik_orientation_weight: float = 0.0,
     ):
         self.leader_kin = leader_kinematics
         self.follower_kin = follower_kinematics
@@ -224,7 +224,7 @@ def make_takeover_mode(
     ee_bounds_max: list[float] | None = None,
     deadband_m: float = 0.0005,
     ik_pos_tolerance_m: float = 0.02,
-    ik_orientation_weight: float = 0.001,
+    ik_orientation_weight: float = 0.0,
 ) -> TakeoverMode:
     """Instantiate a TakeoverMode by name.
 
