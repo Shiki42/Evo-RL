@@ -169,9 +169,11 @@ class EEDeltaIKTakeover(TakeoverMode):
         return target
 
     def _solve_ik(self, follower_obs: RobotObservation, target: np.ndarray) -> np.ndarray:
-        follower_q = _extract_joint_array(follower_obs, self.motor_names)
+        # Use last IK solution as initial guess for solver stability (Test 2 pattern).
+        # Falls back to live joint positions only on first call after on_enter.
+        initial_guess = self._last_safe_q
         q_result = self.follower_kin.inverse_kinematics(
-            follower_q, target, orientation_weight=self.ik_orientation_weight
+            initial_guess, target, orientation_weight=self.ik_orientation_weight
         )
 
         # Validate IK solution via FK roundtrip (placo solver always returns a result
