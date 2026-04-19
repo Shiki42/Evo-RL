@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import pytest
 
 from lerobot.rlt.losses import discounted_chunk_return, critic_loss, actor_loss
@@ -107,3 +108,44 @@ def test_target_is_stop_gradiented(actor, critic, target_critic, batch):
     loss.backward()
     for p in target_critic.parameters():
         assert p.grad is None
+
+
+def test_actor_loss_matches_paper_bc_scaling():
+    """BC term must be per-sample squared-distance sum averaged over batch.
+
+    This is the paper's β convention; it differs from F.mse_loss (mean over
+    all elements) by a factor of C * D_flat. We pin the numerical value with a
+    deterministic (mu, ref) pair and a stub critic that returns a constant Q
+    (so d/dβ of the loss equals the BC term exactly), and check the ratio
+    relative to mean-MSE.
+    """
+    torch.manual_seed(0)
+    B = 4
+    D_flat = CHUNK_DIM  # = C * D
+    mu = torch.randn(B, D_flat)
+    ref = torch.randn(B, D_flat)
+
+    class _StubActor:
+        def forward(self, x, ref, training=False):
+            return mu, None
+
+    class _StubCritic:
+        def min_q(self, x, a):
+            return torch.zeros(a.shape[0], 1)
+
+    stub_batch = {
+        "state_vec": torch.randn(B, STATE_DIM),
+        "ref_chunk_flat": ref,
+    }
+
+    # Loss at beta=0 removes BC contribution (leaves -q.mean()=0).
+    loss_beta0 = actor_loss(_StubActor(), _StubCritic(), stub_batch, beta=0.0)
+    loss_beta1 = actor_loss(_StubActor(), _StubCritic(), stub_batch, beta=1.0)
+    bc_reg_observed = (loss_beta1 - loss_beta0).item()
+
+    expected_bc = ((mu - ref) ** 2).sum(dim=-1).mean().item()
+    assert bc_reg_observed == pytest.approx(expected_bc, rel=1e-6)
+
+    # The new convention equals mean-MSE * (C * D_flat).
+    mean_mse = F.mse_loss(mu, ref).item()
+    assert bc_reg_observed == pytest.approx(mean_mse * D_flat, rel=1e-6)

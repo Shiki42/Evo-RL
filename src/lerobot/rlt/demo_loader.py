@@ -110,6 +110,31 @@ class RLTDemoDataset(Dataset):
     def __len__(self) -> int:
         return len(self._dataset)
 
+    def get_episode_success(self, episode_idx: int) -> bool:
+        """Return per-episode success flag stored at recording time.
+
+        The column ``episode_success`` is written by ``LeRobotDataset.save_episode
+        (extra_episode_metadata=...)`` in ``lerobot_record.py`` around the episode-
+        end hook. Canonical labels are ``"success"`` / ``"failure"`` (strings); bool
+        and 0/1 numeric are also accepted. Strict on missing column: any dataset
+        that lacks ``episode_success`` must be relabeled before use — see
+        docs/rlt/rlt_pipeline_review_20260415_1839.md S2-2.
+        """
+        raw = self._dataset.meta.episodes["episode_success"][episode_idx]
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized == "success":
+                return True
+            if normalized == "failure":
+                return False
+        elif isinstance(raw, bool):
+            return raw
+        elif isinstance(raw, (int, float)) and raw in (0, 1):
+            return bool(raw)
+        raise ValueError(
+            f"Unrecognized episode_success value for episode {episode_idx}: {raw!r}"
+        )
+
     def __getitem__(self, idx: int) -> dict:
         item = self._dataset[idx]
         result = {}

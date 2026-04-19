@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch.utils.data import DataLoader, Dataset
 
+from lerobot.rlt.demo_loader import rlt_demo_collate
 from lerobot.rlt.interfaces import ChunkTransition
 from lerobot.rlt.offline_dataset import (
     build_overlap_frame_indices,
+    build_transitions_from_demos,
     split_episode_indices,
     save_transition_cache,
     load_transition_cache,
@@ -158,6 +161,45 @@ def test_build_overlap_frame_indices_keeps_terminal_anchor():
     assert indices == [0, 2, 3, 4, 6, 8, 10, 12, 13]
 
 
+def test_encoded_to_transitions_respects_episode_success_flag():
+    """When episode_success=False, terminal chunk reward must sum to 0."""
+    from lerobot.rlt.offline_dataset import _encoded_to_transitions
+
+    state_dim, action_dim, C = 10, 4, 3
+    frame_indices = list(range(5))
+    encoded = []
+    for _ in frame_indices:
+        encoded.append((
+            torch.randn(state_dim),
+            torch.randn(C, action_dim),
+            torch.randn(C, action_dim),
+        ))
+
+    failed = _encoded_to_transitions(
+        encoded=encoded,
+        frame_indices=frame_indices,
+        episode_last_frame=4,
+        chunk_length=C,
+        stride=1,
+        episode_success=False,
+    )
+    assert failed[-1].done.item() == 1.0
+    assert failed[-1].reward_seq.sum().item() == 0.0
+    for t in failed:
+        assert t.reward_seq.sum().item() == 0.0
+
+    succeeded = _encoded_to_transitions(
+        encoded=encoded,
+        frame_indices=frame_indices,
+        episode_last_frame=4,
+        chunk_length=C,
+        stride=1,
+        episode_success=True,
+    )
+    assert succeeded[-1].done.item() == 1.0
+    assert torch.equal(succeeded[-1].reward_seq, torch.tensor([0.0, 0.0, 1.0]))
+
+
 def test_encoded_to_transitions_accepts_irregular_terminal_anchor():
     from lerobot.rlt.offline_dataset import _encoded_to_transitions
 
@@ -183,3 +225,69 @@ def test_encoded_to_transitions_accepts_irregular_terminal_anchor():
     assert len(transitions) == 3
     assert torch.allclose(transitions[-1].next_state_vec, encoded[8][0])  # x_{3+10}=x_13
     assert transitions[-1].done.item() == 1.0
+
+
+class _DemoBatchDataset(Dataset):
+    def __init__(self, num_frames: int, chunk_length: int, proprio_dim: int, action_dim: int):
+        self._items = []
+        for frame_idx in range(num_frames):
+            self._items.append({
+                "proprio": torch.full((proprio_dim,), float(frame_idx)),
+                "expert_actions": torch.full((chunk_length, action_dim), float(frame_idx)),
+            })
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return self._items[idx]
+
+
+class _FakePolicy:
+    def __init__(self, chunk_length: int, action_dim: int):
+        self.chunk_length = chunk_length
+        self.action_dim = action_dim
+
+    def eval(self) -> None:
+        return None
+
+    def encode_observation(self, obs):
+        state_vec = obs.proprio.float()
+        ref_chunk = state_vec[:, :1].unsqueeze(-1).repeat(1, self.chunk_length, self.action_dim)
+        return state_vec, ref_chunk
+
+
+def _build_demo_transitions_for_episode_success(episode_success: bool):
+    chunk_length = 3
+    action_dim = 2
+    dataset = _DemoBatchDataset(num_frames=5, chunk_length=chunk_length, proprio_dim=4, action_dim=action_dim)
+    loader = DataLoader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        collate_fn=rlt_demo_collate,
+        num_workers=0,
+        drop_last=False,
+    )
+    return build_transitions_from_demos(
+        policy=_FakePolicy(chunk_length=chunk_length, action_dim=action_dim),
+        demo_loader=loader,
+        frame_indices=[0, 1, 2, 3, 4],
+        episode_last_frame=4,
+        chunk_length=chunk_length,
+        device="cpu",
+        episode_id=3,
+        episode_success=episode_success,
+    )
+
+
+def test_build_transitions_from_demos_terminal_failure_has_zero_reward():
+    transitions = _build_demo_transitions_for_episode_success(episode_success=False)
+    assert transitions[-1].done.item() == 1.0
+    assert transitions[-1].reward_seq.sum().item() == pytest.approx(0.0)
+
+
+def test_build_transitions_from_demos_terminal_success_rewards_last_step():
+    transitions = _build_demo_transitions_for_episode_success(episode_success=True)
+    assert transitions[-1].done.item() == 1.0
+    assert torch.equal(transitions[-1].reward_seq, torch.tensor([0.0, 0.0, 1.0]))

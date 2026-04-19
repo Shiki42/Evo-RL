@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from lerobot.rlt.trainer import offline_rl_loop
@@ -16,7 +17,8 @@ def test_offline_rl_loop_runs():
 
     metrics = offline_rl_loop(algorithm, cfg, buf)
 
-    assert len(metrics.critic_losses) == cfg.offline_rl.num_gradient_steps
+    expected_critic = cfg.offline_rl.num_gradient_steps * cfg.training.utd_ratio
+    assert len(metrics.critic_losses) == expected_critic
     assert len(metrics.actor_losses) > 0
     assert all(not math.isnan(l) for l in metrics.critic_losses)
     assert all(not math.isnan(l) for l in metrics.actor_losses)
@@ -73,4 +75,43 @@ def test_offline_rl_loop_with_val_buffer():
 
     metrics = offline_rl_loop(algorithm, cfg, train_buf, val_buffer=val_buf)
 
-    assert len(metrics.critic_losses) == cfg.offline_rl.num_gradient_steps
+    expected_critic = cfg.offline_rl.num_gradient_steps * cfg.training.utd_ratio
+    assert len(metrics.critic_losses) == expected_critic
+
+
+@pytest.mark.parametrize("utd", [1, 5])
+def test_offline_rl_loop_honors_utd_ratio(utd):
+    """With utd=k: critic_update is called k*num_gradient_steps times but
+    soft_update_target is called num_gradient_steps times (bundled per outer
+    step, so target rate is independent of UTD). Actor fires every
+    `actor_update_interval` critic updates, totaling (k*steps)//interval."""
+    algorithm, cfg = make_test_algorithm(num_gradient_steps=4, actor_update_interval=2)
+    cfg.training.utd_ratio = utd
+    algorithm.policy.freeze_vla()
+    algorithm.policy.freeze_rl_token_encoder()
+
+    counts = {"critic": 0, "actor": 0, "soft": 0}
+
+    def _critic(batch, opt, gamma, C):
+        counts["critic"] += 1
+        return 0.0
+
+    def _actor(batch, opt, beta):
+        counts["actor"] += 1
+        return 0.0
+
+    def _soft(tau):
+        counts["soft"] += 1
+
+    algorithm.critic_update = _critic
+    algorithm.actor_update = _actor
+    algorithm.soft_update_target = _soft
+
+    buf = fill_buffer()
+    offline_rl_loop(algorithm, cfg, buf)
+
+    num_steps = cfg.offline_rl.num_gradient_steps
+    actor_interval = cfg.training.actor_update_interval
+    assert counts["critic"] == num_steps * utd
+    assert counts["soft"] == num_steps
+    assert counts["actor"] == (num_steps * utd) // actor_interval

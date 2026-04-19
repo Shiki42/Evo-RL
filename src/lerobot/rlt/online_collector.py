@@ -67,6 +67,9 @@ class RLTOnlineCollector:
         return None
 
     def flush_episode(self, episode_success: bool) -> ChunkTransition | None:
+        # TODO(online-rl): episode_success is accepted but discarded. Before enabling the
+        # online collector, thread it into _emit_transition so the terminal chunk's
+        # reward_seq carries success_bonus. See docs/rlt/rlt_pipeline_review_20260415_1839.md S2-1.
         if self._frame_actions:
             return self._emit_transition(done=True)
         # Episode length was exact multiple of C — mark last emitted chunk as terminal
@@ -95,6 +98,9 @@ class RLTOnlineCollector:
             ref = exec_chunk.clone()
 
         state = self._chunk_state.cpu()
+        # TODO(online-rl): inject terminal success reward here before real-robot online RL
+        # is enabled. Currently this collector is unwired — flush_episode is never called
+        # from the recording loop. See docs/rlt/rlt_pipeline_review_20260415_1839.md S2-1.
         transition = ChunkTransition(
             state_vec=state,
             exec_chunk=exec_chunk,

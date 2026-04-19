@@ -155,6 +155,7 @@ def main() -> None:
                 num_workers=0,
                 drop_last=False,
             )
+            episode_success = dataset.get_episode_success(episode_id)
             ep_transitions = build_transitions_from_demos(
                 policy=policy,
                 demo_loader=loader,
@@ -166,6 +167,7 @@ def main() -> None:
                 is_critical=float(args.mark_critical),
                 stride=config.offline_rl.frame_stride,
                 source=_bucket_source_id(args.bucket_mode),
+                episode_success=episode_success,
             )
 
             start_anchors = [

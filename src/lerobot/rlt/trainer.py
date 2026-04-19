@@ -316,23 +316,27 @@ def offline_rl_loop(
     gamma = config.training.gamma
     beta = config.training.beta
     tau = config.training.tau
+    utd = config.training.utd_ratio
     actor_interval = config.training.actor_update_interval
     batch_size = config.training.batch_size
     critic_update_count = 0
     device = next(algorithm.parameters()).device
 
     algorithm.train()
+    # `num_gradient_steps` is outer steps; total gradient updates = utd * num_gradient_steps.
     for step in range(1, off_cfg.num_gradient_steps + 1):
-        batch = _batch_to_device(replay_buffer.sample(batch_size), device)
-
-        c_loss = algorithm.critic_update(batch, critic_optimizer, gamma, C)
-        metrics.critic_losses.append(c_loss)
-        critic_update_count += 1
-
+        c_loss = 0.0
         a_loss = None
-        if critic_update_count % actor_interval == 0:
-            a_loss = algorithm.actor_update(batch, actor_optimizer, beta)
-            metrics.actor_losses.append(a_loss)
+        for _ in range(utd):
+            batch = _batch_to_device(replay_buffer.sample(batch_size), device)
+
+            c_loss = algorithm.critic_update(batch, critic_optimizer, gamma, C)
+            metrics.critic_losses.append(c_loss)
+            critic_update_count += 1
+
+            if critic_update_count % actor_interval == 0:
+                a_loss = algorithm.actor_update(batch, actor_optimizer, beta)
+                metrics.actor_losses.append(a_loss)
 
         algorithm.soft_update_target(tau)
 

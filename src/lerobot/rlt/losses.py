@@ -77,10 +77,13 @@ def actor_loss(
     """Q-maximization + BC regularization toward VLA reference.
 
     Uses deterministic mean (not noisy samples) for stable optimization.
+    BC term is the per-sample squared distance summed across action dims, then
+    averaged over the batch — matching the paper's β-scaling convention. This
+    differs from mean-MSE by a factor of C*D_flat.
     """
     x = batch["state_vec"]
     ref = batch["ref_chunk_flat"]
     mu, _ = actor.forward(x, ref, training=True)
     q = critic.min_q(x, mu)
-    bc_reg = F.mse_loss(mu, ref)
+    bc_reg = ((mu - ref) ** 2).sum(dim=-1).mean()
     return -q.mean() + beta * bc_reg
