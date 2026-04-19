@@ -41,3 +41,16 @@ def test_evaluate_offline_q_gap_sign():
     assert not math.isnan(metrics.q_gap)
     # q_gap is mean_q_policy - mean_q_expert: should be a finite number
     assert math.isfinite(metrics.q_gap)
+
+
+def test_evaluate_offline_reports_ref_dropped_mse():
+    algorithm, cfg = make_test_algorithm()
+    algorithm.policy.freeze_vla()
+    algorithm.policy.freeze_rl_token_encoder()
+    val_buf = fill_buffer(30)
+
+    metrics = evaluate_offline(algorithm, val_buf, cfg, num_batches=3)
+
+    assert hasattr(metrics, "ref_dropped_mse")
+    assert not math.isnan(metrics.ref_dropped_mse)
+    assert metrics.ref_dropped_mse >= 0.0

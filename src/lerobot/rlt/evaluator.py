@@ -105,6 +105,7 @@ class OfflineEvalMetrics:
 
     expert_action_mse: float = 0.0  # ||actor(state, ref) - expert||^2
     ref_action_mse: float = 0.0  # ||actor(state, ref) - ref||^2
+    ref_dropped_mse: float = 0.0  # ||actor(state, zeros) - expert||^2 (state-only mapping)
     mean_q_policy: float = 0.0  # Q(state, actor_action)
     mean_q_expert: float = 0.0  # Q(state, expert_action)
     q_gap: float = 0.0  # mean_q_policy - mean_q_expert (should be <= 0)
@@ -127,6 +128,7 @@ def evaluate_offline(
 
     total_expert_mse = 0.0
     total_ref_mse = 0.0
+    total_ref_dropped_mse = 0.0
     total_q_policy = 0.0
     total_q_expert = 0.0
     total_td_error = 0.0
@@ -141,9 +143,11 @@ def evaluate_offline(
 
         with torch.no_grad():
             mu, _ = policy.actor.forward(state_vec, ref_chunk_flat)
+            mu_dropped, _ = policy.actor.forward(state_vec, torch.zeros_like(ref_chunk_flat))
 
             total_expert_mse += F.mse_loss(mu, exec_chunk_flat).item()
             total_ref_mse += F.mse_loss(mu, ref_chunk_flat).item()
+            total_ref_dropped_mse += F.mse_loss(mu_dropped, exec_chunk_flat).item()
 
             total_q_policy += algorithm.critic.min_q(state_vec, mu).mean().item()
             total_q_expert += algorithm.critic.min_q(state_vec, exec_chunk_flat).mean().item()
@@ -159,6 +163,7 @@ def evaluate_offline(
     return OfflineEvalMetrics(
         expert_action_mse=total_expert_mse / n,
         ref_action_mse=total_ref_mse / n,
+        ref_dropped_mse=total_ref_dropped_mse / n,
         mean_q_policy=total_q_policy / n,
         mean_q_expert=total_q_expert / n,
         q_gap=(total_q_policy - total_q_expert) / n,
