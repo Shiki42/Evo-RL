@@ -65,6 +65,8 @@ def demo_adaptation(
     start_step: int = 0,
     prior_losses: list[float] | None = None,
     metadata: dict | None = None,
+    dim_std: torch.Tensor | None = None,
+    norm_gamma: float = 0.0,
 ) -> list[float]:
     """Demo adaptation phase: L_ro + alpha * L_vla.
 
@@ -74,6 +76,8 @@ def demo_adaptation(
     If rl_token_full is provided (e.g. when the caller already created it
     and passed its parameters to demo_optimizer), it is used directly.
     Otherwise a new one is built via algorithm.build_rl_token_full().
+
+    dim_std + norm_gamma enable per-dim weighted MSE in reconstruction_loss.
     """
     import gc
 
@@ -106,7 +110,9 @@ def demo_adaptation(
             pg["lr"] = lr
 
         vla_out = policy.vla.forward_vla(obs)
-        l_ro = rl_token_full.reconstruction_loss(vla_out.final_tokens)
+        l_ro = rl_token_full.reconstruction_loss(
+            vla_out.final_tokens, dim_std=dim_std, gamma=norm_gamma,
+        )
         l_vla = policy.vla.supervised_loss(obs, expert_actions)
         loss = l_ro + alpha * l_vla
 
