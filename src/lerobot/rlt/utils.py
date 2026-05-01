@@ -4,6 +4,26 @@ import torch
 import torch.nn as nn
 
 
+def postprocess_prefix_tokens(
+    final_tokens: torch.Tensor,
+    image_only: bool,
+    num_image_tokens: int,
+    pool_size: int,
+) -> torch.Tensor:
+    """Apply optional image-only slicing then optional adaptive pooling.
+
+    Slicing happens first so pooling never mixes language tokens into image
+    summaries when image_only=True.
+    """
+    if image_only:
+        final_tokens = final_tokens[:, :num_image_tokens, :]
+    if pool_size > 0 and final_tokens.shape[1] > pool_size:
+        final_tokens = final_tokens.permute(0, 2, 1)
+        final_tokens = torch.nn.functional.adaptive_avg_pool1d(final_tokens, pool_size)
+        final_tokens = final_tokens.permute(0, 2, 1)
+    return final_tokens
+
+
 def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
     """Polyak averaging: target = (1-tau)*target + tau*source."""
     for tp, sp in zip(target.parameters(), source.parameters()):

@@ -208,6 +208,7 @@ class RLTRecordConfig:
     chunk_length: int = 10
     chunk_exec_steps: int = 25
     token_pool_size: int = 64
+    image_only: bool = False
     deterministic: bool = True
     actor_hidden_dim: int = 256
     actor_num_layers: int = 3
@@ -335,6 +336,7 @@ class RecordConfig:
                 chunk_length=self.rlt.chunk_length,
                 chunk_exec_steps=self.rlt.chunk_exec_steps,
                 token_pool_size=self.rlt.token_pool_size,
+                image_only=self.rlt.image_only,
                 deterministic=self.rlt.deterministic,
                 actor_hidden_dim=self.rlt.actor_hidden_dim,
                 actor_num_layers=self.rlt.actor_num_layers,

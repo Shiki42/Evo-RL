@@ -134,6 +134,7 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
         # Prefix output capture (hook attached lazily when PI05 loads)
         self.prefix_capture = PrefixOutputCapture(
             token_pool_size=config.token_pool_size,
+            image_only=config.image_only,
         )
 
         # Inner PI05Policy -- deferred to avoid 7 GB memory at init time

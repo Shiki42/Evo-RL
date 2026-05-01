@@ -214,6 +214,7 @@ def main():
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--task-instruction", default="Insert the copper screw into the black sleeve.")
     parser.add_argument("--start-from", type=int, default=0)
+    parser.add_argument("--image-only", action="store_true", help="Drop language tokens before pooling/encode.")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -234,6 +235,7 @@ def main():
         dtype=args.dtype,
         device=args.device,
         token_pool_size=64,  # default, will be overridden per experiment
+        image_only=args.image_only,
     )
     logger.info("VLA loaded")
 

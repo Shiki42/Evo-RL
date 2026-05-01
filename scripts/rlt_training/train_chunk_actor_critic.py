@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actor-lr", type=float, default=None)
     parser.add_argument("--critic-lr", type=float, default=None)
     parser.add_argument("--token-pool-size", type=int, default=0, help="Pool prefix tokens before RL token encoding (0 disables pooling).")
+    parser.add_argument("--image-only", action="store_true", help="Drop language tokens before RL token encode (image-patch tokens only).")
     parser.add_argument("--task-instruction", default="pick up the object")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     return parser.parse_args()
@@ -124,6 +125,7 @@ def create_algorithm_with_pi05(config, args: argparse.Namespace):
         token_pool_size=args.token_pool_size,
         dtype=args.dtype,
         rl_token_checkpoint=args.rl_token_checkpoint,
+        image_only=args.image_only,
     )
     policy.freeze_vla()
     policy.freeze_rl_token_encoder()

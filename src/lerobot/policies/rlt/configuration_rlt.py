@@ -35,6 +35,7 @@ class RLTPretrainedConfig(PreTrainedConfig):
     vla_revision: str | None = None
     task_instruction: str = ""
     token_pool_size: int = 64
+    image_only: bool = False  # if true, drop language tokens before RL token encode
 
     # --- Checkpoint paths (loaded during __init__) ---
     rl_token_ckpt_path: str = ""

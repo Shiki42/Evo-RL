@@ -14,6 +14,7 @@ from lerobot.policies.pi05.modeling_pi05 import (
     resize_with_pad_torch,
 )
 from lerobot.rlt.interfaces import Observation, VLAOutput
+from lerobot.rlt.utils import postprocess_prefix_tokens
 from lerobot.rlt.vla_adapter import VLAAdapter
 
 
@@ -38,6 +39,7 @@ class Pi05VLAAdapter(VLAAdapter):
         num_inference_steps: int = 10,
         cache_dir: str | None = None,
         token_pool_size: int = 0,  # 0 = no pooling, >0 = pool prefix tokens to this size
+        image_only: bool = False,  # if true, drop language tokens before pooling/encode
         tokenizer_path: str | None = None,  # local path to tokenizer (avoids HF download)
     ):
         super().__init__()
@@ -48,6 +50,7 @@ class Pi05VLAAdapter(VLAAdapter):
         self.actual_proprio_dim = actual_proprio_dim
         self.task_instruction = self._clean_task(task_instruction)
         self.token_pool_size = token_pool_size
+        self.image_only = image_only
 
         self.camera_name_map = camera_name_map or {
             "left_wrist": "observation.images.left_wrist_0_rgb",
@@ -101,6 +104,10 @@ class Pi05VLAAdapter(VLAAdapter):
 
         for param in self.pi05.parameters():
             param.requires_grad = False
+
+        vision_cfg = self.pi05.paligemma_with_expert.paligemma.config.vision_config
+        n_per_cam = (pi05_config.image_resolution[0] // vision_cfg.patch_size) ** 2
+        self._num_image_tokens = n_per_cam * len(self.camera_order)
 
     @staticmethod
     def _clean_task(task_instruction: str) -> str:
@@ -234,13 +241,13 @@ class Pi05VLAAdapter(VLAAdapter):
 
         sampled_actions = x_t[:, :, : self.actual_action_dim]
 
-        # Optional pooling: reduce ~968 tokens to pool_size for RL token encoder
-        final_tokens = prefix_output.to(dtype=torch.float32)
-        if self.token_pool_size > 0 and final_tokens.shape[1] > self.token_pool_size:
-            # Adaptive average pooling along token dim: (B, M, D) -> (B, pool_size, D)
-            final_tokens = final_tokens.permute(0, 2, 1)  # (B, D, M)
-            final_tokens = torch.nn.functional.adaptive_avg_pool1d(final_tokens, self.token_pool_size)
-            final_tokens = final_tokens.permute(0, 2, 1)  # (B, pool_size, D)
+        # Optional image-only slicing then pooling for RL token encoder.
+        final_tokens = postprocess_prefix_tokens(
+            prefix_output.to(dtype=torch.float32),
+            image_only=self.image_only,
+            num_image_tokens=self._num_image_tokens,
+            pool_size=self.token_pool_size,
+        )
 
         return VLAOutput(
             final_tokens=final_tokens,

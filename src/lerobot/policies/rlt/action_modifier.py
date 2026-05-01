@@ -4,13 +4,12 @@ from collections import deque
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 
 from lerobot.rlt.actor import ChunkActor
 from lerobot.rlt.phase_controller import PhaseController
 from lerobot.rlt.rl_token import RLTokenModule
-from lerobot.rlt.utils import flatten_chunk, unflatten_chunk
+from lerobot.rlt.utils import flatten_chunk, postprocess_prefix_tokens, unflatten_chunk
 
 
 class PrefixOutputCapture:
@@ -21,21 +20,36 @@ class PrefixOutputCapture:
     never fire.  Instead we monkey-patch ``forward`` to intercept the
     prefix-only call (``inputs_embeds=[prefix_embs, None]``).
 
-    After capture the raw prefix tokens are pooled from (B, ~968, 2048) to
+    After capture the raw prefix tokens are optionally sliced to image-only
+    (dropping language tokens) and pooled from (B, ~968, 2048) to
     (B, token_pool_size, 2048) via adaptive average pooling.
     """
 
-    def __init__(self, token_pool_size: int = 64):
+    def __init__(
+        self,
+        token_pool_size: int = 64,
+        image_only: bool = False,
+        num_image_tokens: int = 0,
+    ):
         self.token_pool_size = token_pool_size
+        self.image_only = image_only
+        self.num_image_tokens = num_image_tokens
         self._captured: Tensor | None = None
         self._original_forward = None
         self._target = None
 
     def attach(self, policy) -> None:
-        """Monkey-patch ``forward`` on ``policy.model.paligemma_with_expert``."""
+        """Monkey-patch ``forward`` on ``policy.model.paligemma_with_expert``.
+
+        When image_only is true and num_image_tokens is unset (0), derive it from
+        the SigLIP vision config so callers don't need to know paligemma internals.
+        """
         target = policy.model.paligemma_with_expert
         self._target = target
         self._original_forward = target.forward
+
+        if self.image_only and self.num_image_tokens == 0:
+            self.num_image_tokens = self._infer_num_image_tokens(policy)
 
         capture = self  # closure reference
 
@@ -44,16 +58,22 @@ class PrefixOutputCapture:
             outputs, _past_kv = result
             prefix_tokens = outputs[0]
             if prefix_tokens is not None:
-                capture._captured = capture._pool(prefix_tokens.detach().float())
+                capture._captured = postprocess_prefix_tokens(
+                    prefix_tokens.detach().float(),
+                    image_only=capture.image_only,
+                    num_image_tokens=capture.num_image_tokens,
+                    pool_size=capture.token_pool_size,
+                )
             return result
 
         target.forward = patched_forward
 
-    def _pool(self, tensor: Tensor) -> Tensor:
-        # adaptive_avg_pool1d expects (B, C, L); tensor is (B, L, D)
-        x = tensor.transpose(1, 2)  # (B, D, L)
-        x = F.adaptive_avg_pool1d(x, self.token_pool_size)  # (B, D, pool)
-        return x.transpose(1, 2)  # (B, pool, D)
+    @staticmethod
+    def _infer_num_image_tokens(policy) -> int:
+        pi05_cfg = policy.config
+        vision_cfg = policy.model.paligemma_with_expert.paligemma.config.vision_config
+        n_per_cam = (pi05_cfg.image_resolution[0] // vision_cfg.patch_size) ** 2
+        return n_per_cam * len(pi05_cfg.image_features)
 
     def consume(self) -> Tensor:
         """Return and clear the captured prefix tokens.

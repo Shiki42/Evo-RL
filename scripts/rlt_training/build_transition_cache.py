@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--placeholder", action="store_true", help="Build transitions with zero RL-token features.")
     parser.add_argument("--mark-critical", action="store_true", help="Mark every transition as critical-phase data.")
     parser.add_argument("--token-pool-size", type=int, default=64)
+    parser.add_argument("--image-only", action="store_true", help="Drop language tokens before RL token encode.")
     parser.add_argument("--task-instruction", default="pick up the object")
     parser.add_argument("--frame-stride", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -81,6 +82,7 @@ def build_encoder(args: argparse.Namespace, config):
         token_pool_size=args.token_pool_size,
         dtype=args.dtype,
         rl_token_checkpoint=args.rl_token_checkpoint,
+        image_only=args.image_only,
     )
     policy.freeze_vla()
     policy.freeze_rl_token_encoder()
