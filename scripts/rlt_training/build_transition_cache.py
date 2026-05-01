@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mark-critical", action="store_true", help="Mark every transition as critical-phase data.")
     parser.add_argument("--token-pool-size", type=int, default=64)
     parser.add_argument("--image-only", action="store_true", help="Drop language tokens before RL token encode.")
+    parser.add_argument("--active-cameras", default=None, help="Comma-separated camera names. Implies image-only.")
+    parser.add_argument("--num-rl-tokens", type=int, default=None, help="Override RL token count (must match the trained ckpt).")
     parser.add_argument("--task-instruction", default="pick up the object")
     parser.add_argument("--frame-stride", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -83,6 +85,7 @@ def build_encoder(args: argparse.Namespace, config):
         dtype=args.dtype,
         rl_token_checkpoint=args.rl_token_checkpoint,
         image_only=args.image_only,
+        active_cameras=args.active_cameras.split(",") if args.active_cameras else None,
     )
     policy.freeze_vla()
     policy.freeze_rl_token_encoder()
@@ -105,6 +108,8 @@ def main() -> None:
 
     config = load_training_config(args.config)
     config.offline_rl.frame_stride = args.frame_stride
+    if args.num_rl_tokens is not None:
+        config.rl_token.num_rl_tokens = args.num_rl_tokens
     if args.train_ratio is not None:
         config.offline_rl.train_ratio = args.train_ratio
     if args.val_ratio is not None:
