@@ -167,7 +167,8 @@ def load_ac_metadata(ac_ckpt_path: str, metrics_path: str) -> tuple[dict, dict]:
     ac_ckpt = torch.load(ac_ckpt_path, map_location="cpu", weights_only=False)
     metrics = json.loads(Path(metrics_path).read_text())
     inferred = infer_actor_architecture(ac_ckpt["actor_state_dict"])
-    return ac_ckpt, metrics.get("config", {}) or inferred
+    ckpt_metadata = ac_ckpt.get("metadata", {}) or {}
+    return ac_ckpt, {**inferred, **(metrics.get("config", {}) or {}), **ckpt_metadata}
 
 
 def build_policy(args: argparse.Namespace, config_path: str, rl_paths: RLModelPaths | None):

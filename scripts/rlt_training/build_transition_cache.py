@@ -165,6 +165,7 @@ def main() -> None:
                 stride=config.offline_rl.frame_stride,
             )
             transitions.extend(episode_transitions)
+            print(f"[EP {split_name}] {episode_index}/{len(episode_ids)} ep={episode_id} cum_trans={len(transitions)}", flush=True)
             if episode_index % 20 == 0:
                 logger.info(
                     "[%s] %d/%d episodes, %d transitions",

@@ -105,7 +105,7 @@ class OfflineEvalMetrics:
 
     expert_action_mse: float = 0.0  # ||actor(state, ref) - expert||^2
     ref_action_mse: float = 0.0  # ||actor(state, ref) - ref||^2
-    ref_dropped_mse: float = 0.0  # ||actor(state, zeros) - expert||^2 (state-only mapping)
+    ref_dropped_mse: float = 0.0  # ||actor(state, 0) - expert||^2
     mean_q_policy: float = 0.0  # Q(state, actor_action)
     mean_q_expert: float = 0.0  # Q(state, expert_action)
     q_gap: float = 0.0  # mean_q_policy - mean_q_expert (should be <= 0)
