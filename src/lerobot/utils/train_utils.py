@@ -13,12 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
+import json
 from pathlib import Path
 
+from safetensors.torch import save_file
+from torch import nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
-from lerobot.configs.train import TrainPipelineConfig
+from lerobot.configs.train import RLTokenJointConfig, TrainPipelineConfig
 from lerobot.datasets.utils import load_json, write_json
 from lerobot.optim.optimizers import load_optimizer_state, save_optimizer_state
 from lerobot.optim.schedulers import load_scheduler_state, save_scheduler_state
@@ -62,6 +66,12 @@ def update_last_checkpoint(checkpoint_dir: Path) -> Path:
     last_checkpoint_dir.symlink_to(relative_target)
 
 
+RL_TOKEN_DIR = "rl_token"
+RL_TOKEN_STATE_FILENAME = "state_dict.safetensors"
+RL_TOKEN_META_FILENAME = "meta.json"
+RL_TOKEN_META_FORMAT_VERSION = 1
+
+
 def save_checkpoint(
     checkpoint_dir: Path,
     step: int,
@@ -71,6 +81,9 @@ def save_checkpoint(
     scheduler: LRScheduler | None = None,
     preprocessor: PolicyProcessorPipeline | None = None,
     postprocessor: PolicyProcessorPipeline | None = None,
+    rl_token: nn.Module | None = None,
+    rl_token_cfg: RLTokenJointConfig | None = None,
+    num_image_tokens: int | None = None,
 ) -> None:
     """This function creates the following directory structure:
 
@@ -108,6 +121,82 @@ def save_checkpoint(
     if postprocessor is not None:
         postprocessor.save_pretrained(pretrained_dir)
     save_training_state(checkpoint_dir, step, optimizer, scheduler)
+    if rl_token is not None:
+        if rl_token_cfg is None:
+            raise ValueError("save_checkpoint(rl_token=...) requires rl_token_cfg to be set.")
+        save_rl_token_state(
+            checkpoint_dir=checkpoint_dir,
+            rl_token=rl_token,
+            rl_token_cfg=rl_token_cfg,
+            num_image_tokens=num_image_tokens,
+        )
+
+
+def save_rl_token_state(
+    checkpoint_dir: Path,
+    rl_token: nn.Module,
+    rl_token_cfg: RLTokenJointConfig,
+    num_image_tokens: int | None = None,
+) -> None:
+    """Persist RL Token module state + meta.json into <checkpoint_dir>/rl_token/.
+
+    See docs/rlt/joint_train_plan.md section 5 for the meta.json schema.
+    """
+    rl_token_dir = checkpoint_dir / RL_TOKEN_DIR
+    rl_token_dir.mkdir(parents=True, exist_ok=True)
+
+    state_dict = {k: v.detach().contiguous().cpu() for k, v in rl_token.state_dict().items()}
+    save_file(state_dict, rl_token_dir / RL_TOKEN_STATE_FILENAME)
+
+    module_config = {
+        "token_dim": int(getattr(rl_token, "token_dim")),
+        "nhead": int(rl_token_cfg.nhead),
+        "num_enc_layers": int(rl_token_cfg.num_enc_layers),
+        "num_dec_layers": int(rl_token_cfg.num_dec_layers),
+        "ff_dim": rl_token_cfg.ff_dim if rl_token_cfg.ff_dim is None else int(rl_token_cfg.ff_dim),
+        "num_rl_tokens": int(getattr(rl_token, "num_rl_tokens")),
+        "inference_only": bool(getattr(rl_token, "inference_only", False)),
+    }
+
+    meta = {
+        "format_version": RL_TOKEN_META_FORMAT_VERSION,
+        "module": "lerobot.rlt.rl_token.RLTokenModule",
+        "train_config": dataclasses.asdict(rl_token_cfg),
+        "module_config": module_config,
+        "postprocess": {
+            "image_only": bool(rl_token_cfg.image_only),
+            "token_pool_size": int(rl_token_cfg.token_pool_size),
+            "num_image_tokens": (None if num_image_tokens is None else int(num_image_tokens)),
+        },
+    }
+    with open(rl_token_dir / RL_TOKEN_META_FILENAME, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def load_rl_token_state(
+    checkpoint_dir: Path, rl_token: nn.Module, strict: bool = True
+) -> dict:
+    """Load <checkpoint_dir>/rl_token/state_dict.safetensors into the given module.
+
+    Returns the parsed meta.json dict for caller-side validation.
+    """
+    from safetensors.torch import load_file
+
+    rl_token_dir = checkpoint_dir / RL_TOKEN_DIR
+    state_path = rl_token_dir / RL_TOKEN_STATE_FILENAME
+    meta_path = rl_token_dir / RL_TOKEN_META_FILENAME
+    if not state_path.exists():
+        raise FileNotFoundError(f"Missing rl_token state: {state_path}")
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Missing rl_token meta: {meta_path}")
+
+    sd = load_file(str(state_path))
+    target_device = next(rl_token.parameters()).device
+    sd = {k: v.to(target_device) for k, v in sd.items()}
+    rl_token.load_state_dict(sd, strict=strict)
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return meta
 
 
 def save_training_state(

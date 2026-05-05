@@ -26,7 +26,7 @@ from termcolor import colored
 from torch.optim import Optimizer
 
 from lerobot.configs import parser
-from lerobot.configs.train import TrainPipelineConfig
+from lerobot.configs.train import RLTokenJointConfig, TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
@@ -45,6 +45,7 @@ from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_rl_token_state,
     load_training_state,
     save_checkpoint,
     update_last_checkpoint,
@@ -54,6 +55,117 @@ from lerobot.utils.utils import (
     has_method,
     init_logging,
 )
+
+
+def _validate_rl_token_meta(
+    meta: dict,
+    rl_token: torch.nn.Module,
+    cfg: TrainPipelineConfig,
+) -> None:
+    """Verify checkpoint meta.json matches the current RLTokenJointConfig + module shape."""
+    module_cfg = meta.get("module_config", {})
+    expected = {
+        "token_dim": int(getattr(rl_token, "token_dim")),
+        "num_rl_tokens": cfg.rl_token.num_rl_tokens,
+        "num_enc_layers": cfg.rl_token.num_enc_layers,
+        "num_dec_layers": cfg.rl_token.num_dec_layers,
+        "ff_dim": cfg.rl_token.ff_dim,
+    }
+    mismatches = {
+        key: (module_cfg.get(key), expected_value)
+        for key, expected_value in expected.items()
+        if module_cfg.get(key) != expected_value
+    }
+    if mismatches:
+        raise ValueError(
+            f"rl_token checkpoint meta.json does not match cfg.rl_token: {mismatches}"
+        )
+
+
+def _maybe_build_rl_token(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    device: torch.device,
+) -> tuple[torch.nn.Module | None, int | None]:
+    """Build RLTokenModule + compute num_image_tokens when cfg.rl_token.enable.
+
+    Returns (None, None) when disabled. Validation has already enforced policy.type == 'pi05'
+    and the absence of PEFT / compile_model.
+    """
+    if not cfg.rl_token.enable:
+        return None, None
+
+    from lerobot.rlt.rl_token import RLTokenModule
+
+    unwrapped = policy
+    if hasattr(unwrapped, "module"):
+        unwrapped = unwrapped.module
+
+    pwx = unwrapped.model.paligemma_with_expert
+    token_dim = pwx.paligemma.config.text_config.hidden_size
+    rl_token = RLTokenModule(
+        token_dim=token_dim,
+        nhead=cfg.rl_token.nhead,
+        num_enc_layers=cfg.rl_token.num_enc_layers,
+        num_dec_layers=cfg.rl_token.num_dec_layers,
+        ff_dim=cfg.rl_token.ff_dim,
+        num_rl_tokens=cfg.rl_token.num_rl_tokens,
+        inference_only=False,
+    ).to(device)
+
+    vision_cfg = pwx.paligemma.config.vision_config
+    tokens_per_camera = (unwrapped.config.image_resolution[0] // vision_cfg.patch_size) ** 2
+    num_image_tokens = tokens_per_camera * len(unwrapped.config.image_features)
+    return rl_token, num_image_tokens
+
+
+def _joint_forward(
+    *,
+    policy: PreTrainedPolicy,
+    batch: Any,
+    rabc_batch_weights,
+    rabc_batch_stats,
+    rl_token: torch.nn.Module,
+    rl_token_cfg: RLTokenJointConfig,
+    num_image_tokens: int | None,
+) -> tuple[torch.Tensor, dict]:
+    """Joint VLA + RL Token forward path. See docs/rlt/joint_train_plan.md section 4."""
+    from lerobot.rlt.utils import postprocess_prefix_tokens
+
+    if rl_token_cfg is None:
+        raise ValueError("_joint_forward requires rl_token_cfg.")
+    if num_image_tokens is None:
+        raise ValueError("_joint_forward requires num_image_tokens.")
+
+    if rabc_batch_weights is not None:
+        per_sample_loss_vla, output_dict, prefix_hidden = policy.forward_with_prefix(
+            batch, reduction="none"
+        )
+        epsilon = 1e-6
+        loss_vla = (per_sample_loss_vla * rabc_batch_weights).sum() / (
+            rabc_batch_weights.sum() + epsilon
+        )
+        output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
+        output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
+        output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+    else:
+        loss_vla, output_dict, prefix_hidden = policy.forward_with_prefix(batch)
+
+    prefix_for_rl = postprocess_prefix_tokens(
+        prefix_hidden.to(dtype=torch.float32),
+        image_only=rl_token_cfg.image_only,
+        num_image_tokens=num_image_tokens,
+        pool_size=rl_token_cfg.token_pool_size,
+    )
+    loss_recon = rl_token.reconstruction_loss(prefix_for_rl)
+    loss = loss_vla + rl_token_cfg.weight * loss_recon
+
+    output_dict["loss_vla"] = loss_vla.detach().float().item()
+    output_dict["loss_recon"] = loss_recon.detach().float().item()
+    output_dict["loss_total"] = loss.detach().float().item()
+    output_dict["rl_token_weight"] = float(rl_token_cfg.weight)
+    output_dict["rl_token_prefix_tokens"] = int(prefix_for_rl.shape[1])
+    return loss, output_dict
 
 
 def update_policy(
@@ -66,6 +178,9 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     rabc_weights_provider=None,
+    rl_token: torch.nn.Module | None = None,
+    rl_token_cfg: RLTokenJointConfig | None = None,
+    num_image_tokens: int | None = None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -100,8 +215,17 @@ def update_policy(
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        # Use per-sample loss when RA-BC is enabled for proper weighting
-        if rabc_batch_weights is not None:
+        if rl_token is not None:
+            loss, output_dict = _joint_forward(
+                policy=policy,
+                batch=batch,
+                rabc_batch_weights=rabc_batch_weights,
+                rabc_batch_stats=rabc_batch_stats,
+                rl_token=rl_token,
+                rl_token_cfg=rl_token_cfg,
+                num_image_tokens=num_image_tokens,
+            )
+        elif rabc_batch_weights is not None:
             # Get per-sample losses
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
@@ -122,11 +246,16 @@ def update_policy(
     accelerator.backward(loss)
 
     # Clip gradients if specified
+    if rl_token is not None:
+        params_to_clip = list(policy.parameters()) + list(rl_token.parameters())
+    else:
+        params_to_clip = list(policy.parameters())
+
     if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        grad_norm = accelerator.clip_grad_norm_(params_to_clip, grad_clip_norm)
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
+            params_to_clip, float("inf"), error_if_nonfinite=False
         )
 
     # Optimizer step
@@ -279,6 +408,8 @@ def train(
         peft_cli_overrides = dataclasses.asdict(cfg.peft)
         policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
+    rl_token, num_image_tokens = _maybe_build_rl_token(cfg, policy, device)
+
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
@@ -324,6 +455,33 @@ def train(
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
+    if rl_token is not None:
+        rl_token_lr = cfg.optimizer.lr * cfg.rl_token.lr_multiplier
+        optimizer.add_param_group(
+            {
+                "params": [p for p in rl_token.parameters() if p.requires_grad],
+                "lr": rl_token_lr,
+                "name": "rl_token",
+            }
+        )
+        # Pytorch LR schedulers built from a single param group don't auto-extend their internal
+        # state when add_param_group is called later. Patch the cosine/warmup state in-place so
+        # the rl_token group follows the same schedule as the policy group.
+        if lr_scheduler is not None:
+            if hasattr(lr_scheduler, "base_lrs"):
+                lr_scheduler.base_lrs.append(rl_token_lr)
+            if hasattr(lr_scheduler, "lr_lambdas") and lr_scheduler.lr_lambdas:
+                lr_scheduler.lr_lambdas.append(lr_scheduler.lr_lambdas[0])
+            if hasattr(lr_scheduler, "_last_lr"):
+                lr_scheduler._last_lr.append(rl_token_lr)  # noqa: SLF001
+        if is_main_process:
+            logging.info(
+                f"Joint RL Token training enabled: weight={cfg.rl_token.weight}, "
+                f"num_rl_tokens={cfg.rl_token.num_rl_tokens}, "
+                f"token_pool_size={cfg.rl_token.token_pool_size}, "
+                f"image_only={cfg.rl_token.image_only}, lr={rl_token_lr}"
+            )
+
     # Load precomputed SARM progress for RA-BC if enabled
     # Generate progress using: src/lerobot/policies/sarm/compute_rabc_weights.py
     rabc_weights = None
@@ -350,6 +508,10 @@ def train(
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
+        if rl_token is not None:
+            # Load rl_token state BEFORE accelerator.prepare (param identity preservation).
+            meta = load_rl_token_state(cfg.checkpoint_path, rl_token, strict=True)
+            _validate_rl_token_meta(meta, rl_token, cfg)
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -397,11 +559,17 @@ def train(
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
-    # Prepare everything with accelerator
+    # Prepare everything with accelerator. accelerator.prepare(None) is a no-op so passing rl_token=None
+    # is safe; we still avoid the call when rl_token is None to keep enable=False byte-identical.
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
+    if rl_token is not None:
+        policy, optimizer, dataloader, lr_scheduler, rl_token = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler, rl_token
+        )
+    else:
+        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler
+        )
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -473,6 +641,9 @@ def train(
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
+            rl_token=rl_token,
+            rl_token_cfg=cfg.rl_token if rl_token is not None else None,
+            num_image_tokens=num_image_tokens,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -515,6 +686,9 @@ def train(
                     scheduler=lr_scheduler,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
+                    rl_token=(accelerator.unwrap_model(rl_token) if rl_token is not None else None),
+                    rl_token_cfg=(cfg.rl_token if rl_token is not None else None),
+                    num_image_tokens=num_image_tokens,
                 )
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:

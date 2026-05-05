@@ -41,6 +41,23 @@ class ACPConfig:
 
 
 @dataclass
+class RLTokenJointConfig:
+    """Joint VLA + RL Token training. See docs/rlt/joint_train_plan.md."""
+
+    enable: bool = False
+    weight: float = 1.0  # alpha multiplier on L_ro (reconstruction loss)
+    num_rl_tokens: int = 1
+    nhead: int = 8
+    num_enc_layers: int = 3
+    num_dec_layers: int = 3
+    ff_dim: int | None = 4096
+    token_pool_size: int = 64
+    image_only: bool = True
+    lr_multiplier: float = 1.0
+    gradient_checkpointing: bool = False  # placeholder; not wired through RLTokenModule yet
+
+
+@dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
     env: envs.EnvConfig | None = None
@@ -74,6 +91,7 @@ class TrainPipelineConfig(HubMixin):
     wandb: WandBConfig = field(default_factory=WandBConfig)
     peft: PeftConfig | None = None
     acp: ACPConfig = field(default_factory=ACPConfig)
+    rl_token: RLTokenJointConfig = field(default_factory=RLTokenJointConfig)
 
     # RA-BC (Reward-Aligned Behavior Cloning) parameters
     use_rabc: bool = False  # Enable reward-weighted training
@@ -160,6 +178,45 @@ class TrainPipelineConfig(HubMixin):
                 self.rabc_progress_path = str(Path(self.dataset.root) / "sarm_progress.parquet")
             else:
                 self.rabc_progress_path = f"hf://datasets/{repo_id}/sarm_progress.parquet"
+
+        self._validate_rl_token()
+
+    def _validate_rl_token(self) -> None:
+        """Validate RLTokenJointConfig. Splits out from validate() to keep nesting <=3."""
+        rl = self.rl_token
+        if not rl.enable:
+            return
+        if self.policy.type != "pi05":
+            raise ValueError(
+                f"'rl_token.enable=true' requires policy.type='pi05', got '{self.policy.type}'."
+            )
+        if self.peft is not None:
+            raise ValueError(
+                "'rl_token.enable=true' is incompatible with PEFT (PEFT freezes base, theta_vla "
+                "would not update). Disable PEFT or rl_token."
+            )
+        if getattr(self.policy, "compile_model", False):
+            raise ValueError(
+                "'rl_token.enable=true' is incompatible with policy.compile_model=true: "
+                "PI05Pytorch.__init__ compiles forward() and the new forward_with_prefix sibling "
+                "would need separate compilation. Disable compile_model."
+            )
+        if rl.weight < 0:
+            raise ValueError(f"'rl_token.weight' must be >= 0, got {rl.weight}.")
+        if rl.num_rl_tokens < 1:
+            raise ValueError(f"'rl_token.num_rl_tokens' must be >= 1, got {rl.num_rl_tokens}.")
+        if rl.nhead < 1:
+            raise ValueError(f"'rl_token.nhead' must be >= 1, got {rl.nhead}.")
+        if rl.num_enc_layers < 1:
+            raise ValueError(f"'rl_token.num_enc_layers' must be >= 1, got {rl.num_enc_layers}.")
+        if rl.num_dec_layers < 1:
+            raise ValueError(f"'rl_token.num_dec_layers' must be >= 1, got {rl.num_dec_layers}.")
+        if rl.ff_dim is not None and rl.ff_dim < 1:
+            raise ValueError(f"'rl_token.ff_dim' must be >= 1 when set, got {rl.ff_dim}.")
+        if rl.token_pool_size < 0:
+            raise ValueError(f"'rl_token.token_pool_size' must be >= 0, got {rl.token_pool_size}.")
+        if rl.lr_multiplier <= 0:
+            raise ValueError(f"'rl_token.lr_multiplier' must be > 0, got {rl.lr_multiplier}.")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
