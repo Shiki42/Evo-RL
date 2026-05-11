@@ -69,6 +69,12 @@ def resolve_delta_timestamps(
 
 
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
+    # Dispatch on dataset.type for non-LeRobot dataset shapes (e.g. precomputed
+    # chunk transitions for RLT actor-critic training).
+    ds_type = getattr(cfg.dataset, "type", "lerobot")
+    if ds_type == "rlt_chunk_transition":
+        from lerobot.policies.rlt.dataset_rlt_ac import ChunkTransitionDataset
+        return ChunkTransitionDataset(cache_dir=cfg.dataset.repo_id, split="train")
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:

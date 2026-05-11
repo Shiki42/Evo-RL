@@ -22,6 +22,7 @@ from lerobot.datasets.video_utils import get_safe_default_codec
 
 @dataclass
 class DatasetConfig:
+    type: str = "lerobot"  # one of: "lerobot" | "rlt_chunk_transition"
     # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
     # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
     # "dataset_index" into the returned item. The index mapping is made according to the order in which the
