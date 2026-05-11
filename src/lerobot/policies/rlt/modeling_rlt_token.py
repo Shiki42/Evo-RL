@@ -144,11 +144,13 @@ class RLTokenPolicy(PreTrainedPolicy):
     def reset(self) -> None:
         pass
 
-    def get_optim_params(self) -> dict:
-        params: dict[str, list[torch.nn.Parameter]] = {"rl_token": list(self.rl_token.parameters())}
+    def get_optim_params(self) -> list:
+        groups = [
+            {"params": list(self.rl_token.parameters())},
+        ]
         if self.config.vla_ft_weight > 0:
-            params["vla"] = [p for p in self._pi05.parameters() if p.requires_grad]
-        return params
+            groups.append({"params": [p for p in self._pi05.parameters() if p.requires_grad]})
+        return groups
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
         """Reconstruction loss + optional pi0.5 supervised loss."""

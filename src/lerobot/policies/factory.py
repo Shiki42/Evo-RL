@@ -130,6 +130,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
 
         return XVLAPolicy
+    elif name == "rlt_token":
+        from lerobot.policies.rlt.modeling_rlt_token import RLTokenPolicy
+
+        return RLTokenPolicy
+    elif name == "rlt_ac":
+        from lerobot.policies.rlt.modeling_rlt_ac import ChunkACPolicy
+
+        return ChunkACPolicy
     elif name == "rlt":
         from lerobot.policies.rlt.modeling_rlt import RLTPretrainedPolicy
 
@@ -176,6 +184,10 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "rlt_token":
+        return RLTokenPolicyConfig(**kwargs)
+    elif policy_type == "rlt_ac":
+        return ChunkACPolicyConfig(**kwargs)
     elif policy_type == "sac":
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":

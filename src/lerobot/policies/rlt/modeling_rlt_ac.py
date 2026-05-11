@@ -241,11 +241,11 @@ class ChunkACPolicy(PreTrainedPolicy):
         if self.modifier is not None:
             self.modifier.reset()
 
-    def get_optim_params(self) -> dict:
-        return {
-            "actor": list(self.actor.parameters()),
-            "critic": list(self.critic.parameters()),
-        }
+    def get_optim_params(self) -> list:
+        return [
+            {"params": list(self.actor.parameters())},
+            {"params": list(self.critic.parameters())},
+        ]
 
     # ------------------------------------------------------------------
     # Device + train-mode plumbing for the stashed backbone
