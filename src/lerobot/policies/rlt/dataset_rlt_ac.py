@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pathlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -27,6 +27,10 @@ class _MetaShim:
     stats: dict[str, dict[str, torch.Tensor]]
     episodes: _EpisodeIndexShim
     fps: int = 30
+    # ChunkTransitionDataset feeds precomputed transitions; policy.input_features /
+    # output_features are set by ChunkACPolicyConfig.validate_features, not derived
+    # from the dataset. So expose an empty features dict.
+    features: dict = field(default_factory=dict)
 
 
 class ChunkTransitionDataset(Dataset):
