@@ -309,9 +309,9 @@ class RecordConfig:
 
     def __post_init__(self):
         if self.robot_config_file is not None:
-            from lerobot.scripts.robot_config_loader import load_robot_config_fromjson
+            from lerobot.scripts.robot_config_loader import load_robot_config_from_json
 
-            self.robot = load_robot_config_fromjson(self.robot_config_file)
+            self.robot = load_robot_config_from_json(self.robot_config_file)
 
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
         policy_path = parser.get_path_arg("policy")

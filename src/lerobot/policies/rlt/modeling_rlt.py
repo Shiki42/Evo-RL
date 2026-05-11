@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import re
 import torch
 from torch import Tensor
 from typing_extensions import Unpack
@@ -90,6 +91,11 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
         super().__init__(config, *args, **kwargs)
         self.config: RLTPretrainedConfig = config
 
+        if config.rl_token_ckpt_path:
+            self._infer_rl_token_arch_from_ckpt(config.rl_token_ckpt_path)
+        if config.ac_ckpt_path:
+            self._infer_actor_arch_from_ckpt(config.ac_ckpt_path)
+
         # Build RL Token encoder (inference-only: no decoder)
         rl_token = RLTokenModule(
             token_dim=config.rl_token_dim,
@@ -173,6 +179,77 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
     # ------------------------------------------------------------------
     # Checkpoint loading
     # ------------------------------------------------------------------
+
+    def _infer_rl_token_arch_from_ckpt(self, path: str) -> None:
+        """Override config fields to match the RL Token checkpoint architecture.
+
+        Reads ckpt metadata (num_rl_tokens) and state_dict shapes (enc/dec
+        layer count, ff_dim) and writes them back onto self.config so the
+        encoder is built with shapes that match the saved weights.
+        """
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        sd = ckpt.get("rl_token_state_dict", ckpt)
+        cfg = self.config
+
+        meta = ckpt.get("metadata") or {}
+        if meta.get("num_rl_tokens") is not None:
+            cfg.rl_token_num_rl_tokens = int(meta["num_rl_tokens"])
+        elif "rl_token_embed" in sd:
+            cfg.rl_token_num_rl_tokens = int(sd["rl_token_embed"].shape[1])
+
+        for k, v in sd.items():
+            if k.startswith("encoder.") and k.endswith(".linear1.weight"):
+                cfg.rl_token_ff_dim = int(v.shape[0])
+                break
+
+        layer_re = re.compile(r"^(encoder|decoder)\.layers\.(\d+)\.")
+        enc_max = -1
+        dec_max = -1
+        for k in sd:
+            m = layer_re.match(k)
+            if not m:
+                continue
+            idx = int(m.group(2))
+            if m.group(1) == "encoder":
+                enc_max = max(enc_max, idx)
+            else:
+                dec_max = max(dec_max, idx)
+        if enc_max >= 0:
+            cfg.rl_token_enc_layers = enc_max + 1
+        if dec_max >= 0:
+            cfg.rl_token_dec_layers = dec_max + 1
+
+        log.info(
+            "RL Token arch inferred from ckpt: num_rl_tokens=%d enc=%d dec=%d ff_dim=%d",
+            cfg.rl_token_num_rl_tokens,
+            cfg.rl_token_enc_layers,
+            cfg.rl_token_dec_layers,
+            cfg.rl_token_ff_dim,
+        )
+
+    def _infer_actor_arch_from_ckpt(self, path: str) -> None:
+        """Override actor config fields to match the AC checkpoint architecture.
+
+        Reads ckpt metadata (hidden_dim, num_layers, residual, activation,
+        layer_norm) and writes them back onto self.config so the actor is
+        built with shapes that match the saved weights.
+        """
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        meta = (ckpt.get("metadata") or {}).get("actor") or {}
+        cfg = self.config
+        if not meta:
+            return
+        for key in ("hidden_dim", "num_layers", "residual", "activation", "layer_norm"):
+            if key in meta:
+                setattr(cfg, f"actor_{key}", meta[key])
+        log.info(
+            "Actor arch inferred from ckpt: hidden=%d layers=%d residual=%s act=%s ln=%s",
+            cfg.actor_hidden_dim,
+            cfg.actor_num_layers,
+            cfg.actor_residual,
+            cfg.actor_activation,
+            cfg.actor_layer_norm,
+        )
 
     def _load_rlt_checkpoints(self) -> None:
         """Load RL Token encoder and Actor weights from .pt checkpoint files."""
