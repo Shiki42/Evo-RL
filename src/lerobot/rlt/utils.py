@@ -9,13 +9,22 @@ def postprocess_prefix_tokens(
     image_only: bool,
     num_image_tokens: int,
     pool_size: int,
+    num_per_camera: int = 0,
+    active_camera_indices: list[int] | None = None,
 ) -> torch.Tensor:
-    """Apply optional image-only slicing then optional adaptive pooling.
+    """Apply optional camera-subset / image-only slicing then optional pooling.
 
-    Slicing happens first so pooling never mixes language tokens into image
+    Order: camera subset (or image-only fallback) -> pool. Camera subset implies
+    image-only and overrides it. Pooling never mixes language tokens into image
     summaries when image_only=True.
     """
-    if image_only:
+    if active_camera_indices:
+        parts = [
+            final_tokens[:, i * num_per_camera:(i + 1) * num_per_camera, :]
+            for i in active_camera_indices
+        ]
+        final_tokens = torch.cat(parts, dim=1)
+    elif image_only:
         final_tokens = final_tokens[:, :num_image_tokens, :]
     if pool_size > 0 and final_tokens.shape[1] > pool_size:
         final_tokens = final_tokens.permute(0, 2, 1)

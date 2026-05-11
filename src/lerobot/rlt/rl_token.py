@@ -103,9 +103,23 @@ class RLTokenModule(nn.Module):
         out = self.decoder(tgt=dec_input, memory=memory, tgt_mask=causal_mask)
         return self.out_proj(out)
 
-    def reconstruction_loss(self, vla_tokens: torch.Tensor) -> torch.Tensor:
-        """L_ro = E[sum_i || pred_i - z_bar_i ||^2]"""
+    def reconstruction_loss(
+        self,
+        vla_tokens: torch.Tensor,
+        dim_std: torch.Tensor | None = None,
+        gamma: float = 0.0,
+    ) -> torch.Tensor:
+        """L_ro = E[|| (pred_i - z_bar_i) * D^{-gamma} ||^2].
+
+        gamma=0 reduces to vanilla MSE (paper Eq. 2). gamma=1 is full whitening
+        in the per-dim std metric. gamma=0.5 partially compensates the few
+        high-variance dims that otherwise dominate the gradient.
+        """
         z_bar = vla_tokens.detach()
         z_rl_multi = self.encode_multi(z_bar)
         pred = self.decode(z_rl_multi, z_bar)
-        return ((pred - z_bar) ** 2).mean()
+        diff = pred - z_bar
+        if gamma > 0 and dim_std is not None:
+            weight = dim_std.clamp_min(1e-6).pow(-gamma).to(device=diff.device, dtype=diff.dtype)
+            diff = diff * weight
+        return (diff ** 2).mean()

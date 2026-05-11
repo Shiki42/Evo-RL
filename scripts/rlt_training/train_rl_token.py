@@ -33,6 +33,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-checkpoint", default=None, help="Path to an RL token checkpoint to resume from.")
     parser.add_argument("--save-every", type=int, default=2000)
     parser.add_argument("--token-pool-size", type=int, default=0, help="Pool prefix tokens before RL token encoding (0 disables pooling).")
+    parser.add_argument("--image-only", action="store_true", help="Drop language tokens before RL token encode (image-patch tokens only).")
+    parser.add_argument("--active-cameras", default=None,
+                        help="Comma-separated camera names (e.g. 'right_wrist' or 'left_wrist,right_wrist'). Implies image-only and overrides it.")
+    parser.add_argument("--norm-stats", default=None, help="Path to a .pt file with 'std' tensor for per-dim weighted MSE.")
+    parser.add_argument("--norm-gamma", type=float, default=0.0, help="Per-dim weighting exponent. 0=raw MSE, 0.5=partial whitening, 1=full whitening.")
+    parser.add_argument("--num-rl-tokens", type=int, default=None, help="Override config.rl_token.num_rl_tokens.")
+    parser.add_argument("--enc-layers", type=int, default=None, help="Override config.rl_token.enc_layers.")
+    parser.add_argument("--dec-layers", type=int, default=None, help="Override config.rl_token.dec_layers.")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"], help="VLA model dtype")
     parser.add_argument("--vla-cache-dir", default=None, help="Optional Pi0.5 cache directory.")
     return parser.parse_args()
@@ -53,6 +61,14 @@ def main() -> None:
     if args.lr is not None:
         config.demo_adaptation.lr = args.lr
     config.demo_adaptation.vla_ft_weight = args.vla_ft_weight
+    if args.num_rl_tokens is not None:
+        config.rl_token.num_rl_tokens = args.num_rl_tokens
+    if args.enc_layers is not None:
+        config.rl_token.enc_layers = args.enc_layers
+    if args.dec_layers is not None:
+        config.rl_token.dec_layers = args.dec_layers
+
+    active_cameras = args.active_cameras.split(",") if args.active_cameras else None
 
     logger.info("Loading pi0.5 from %s", args.model_path)
     policy = build_pi05_policy(
@@ -63,6 +79,8 @@ def main() -> None:
         token_pool_size=args.token_pool_size,
         dtype=args.dtype,
         vla_cache_dir=args.vla_cache_dir,
+        image_only=args.image_only,
+        active_cameras=active_cameras,
     )
     algorithm = RLTAlgorithm(policy, config)
     logger.info(
@@ -79,6 +97,12 @@ def main() -> None:
         start_step = checkpoint.get("step", 0)
         prior_losses = checkpoint.get("losses", [])
         logger.info("Resumed RL token checkpoint at step %d", start_step)
+
+    dim_std = None
+    if args.norm_stats:
+        stats = torch.load(args.norm_stats, map_location=args.device, weights_only=False)
+        dim_std = stats["std"].to(args.device)
+        logger.info("Loaded dim_std from %s (shape=%s, gamma=%.2f)", args.norm_stats, tuple(dim_std.shape), args.norm_gamma)
 
     demo_loader = make_demo_loader(
         dataset_path=args.demo_dataset_path,
@@ -109,7 +133,17 @@ def main() -> None:
         save_every=args.save_every,
         start_step=start_step,
         prior_losses=prior_losses,
-        metadata={"vla_model": args.model_path, "dataset": args.demo_dataset_path},
+        metadata={
+            "vla_model": args.model_path,
+            "dataset": args.demo_dataset_path,
+            "image_only": args.image_only,
+            "active_cameras": active_cameras,
+            "num_rl_tokens": config.rl_token.num_rl_tokens,
+            "norm_gamma": args.norm_gamma,
+            "norm_stats": args.norm_stats,
+        },
+        dim_std=dim_std,
+        norm_gamma=args.norm_gamma,
     )
     elapsed = time.time() - start_time
     final_loss = losses[-1] if losses else 0.0

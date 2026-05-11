@@ -38,9 +38,10 @@ class Pi05VLAAdapter(VLAAdapter):
         device: str = "cuda",
         num_inference_steps: int = 10,
         cache_dir: str | None = None,
-        token_pool_size: int = 0,  # 0 = no pooling, >0 = pool prefix tokens to this size
-        image_only: bool = False,  # if true, drop language tokens before pooling/encode
-        tokenizer_path: str | None = None,  # local path to tokenizer (avoids HF download)
+        token_pool_size: int = 0,
+        image_only: bool = False,
+        active_cameras: list[str] | None = None,
+        tokenizer_path: str | None = None,
     ):
         super().__init__()
         if num_inference_steps <= 0:
@@ -107,7 +108,23 @@ class Pi05VLAAdapter(VLAAdapter):
 
         vision_cfg = self.pi05.paligemma_with_expert.paligemma.config.vision_config
         n_per_cam = (pi05_config.image_resolution[0] // vision_cfg.patch_size) ** 2
+        self._num_per_camera = n_per_cam
         self._num_image_tokens = n_per_cam * len(self.camera_order)
+        self._active_camera_indices = self._resolve_active_cameras(active_cameras)
+
+    def _resolve_active_cameras(self, active_cameras: list[str] | None) -> list[int] | None:
+        """Map camera obs-keys to indices into self.camera_order. None = all cameras."""
+        if not active_cameras:
+            return None
+        resolved = []
+        for cam in active_cameras:
+            pi05_key = self.camera_name_map.get(cam, cam)
+            if pi05_key not in self.camera_order:
+                raise ValueError(
+                    f"active camera {cam!r} (resolved to {pi05_key!r}) not in camera_order {self.camera_order}"
+                )
+            resolved.append(self.camera_order.index(pi05_key))
+        return sorted(set(resolved))
 
     @staticmethod
     def _clean_task(task_instruction: str) -> str:
@@ -241,12 +258,13 @@ class Pi05VLAAdapter(VLAAdapter):
 
         sampled_actions = x_t[:, :, : self.actual_action_dim]
 
-        # Optional image-only slicing then pooling for RL token encoder.
         final_tokens = postprocess_prefix_tokens(
             prefix_output.to(dtype=torch.float32),
             image_only=self.image_only,
             num_image_tokens=self._num_image_tokens,
             pool_size=self.token_pool_size,
+            num_per_camera=self._num_per_camera,
+            active_camera_indices=self._active_camera_indices,
         )
 
         return VLAOutput(
