@@ -34,6 +34,7 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.rlt.configuration_rlt_token import RLTokenPolicyConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rlt.configuration_rlt import RLTPretrainedConfig
 from lerobot.policies.sac.configuration_sac import SACConfig
@@ -336,6 +337,14 @@ def make_pre_post_processors(
         from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
 
         processors = make_pi05_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, RLTokenPolicyConfig):
+        from lerobot.policies.rlt.processor_rlt_token import make_rlt_token_pre_post_processors
+
+        processors = make_rlt_token_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
