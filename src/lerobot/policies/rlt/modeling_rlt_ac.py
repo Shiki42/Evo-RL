@@ -192,7 +192,7 @@ class ChunkACPolicy(PreTrainedPolicy):
 
     def _ensure_modifier(self) -> RLTActionModifier:
         if self.modifier is None:
-            phase_ctrl = PhaseController(mode=self.config.phase_mode)
+            phase_ctrl = self._build_phase_controller()
             rl_token_module = self._rl_token_policy.rl_token
             self.modifier = RLTActionModifier(
                 rl_token=rl_token_module,
@@ -210,6 +210,24 @@ class ChunkACPolicy(PreTrainedPolicy):
             )
             self._prefix_capture.attach(self._rl_token_policy._pi05)
         return self.modifier
+
+    def _build_phase_controller(self) -> PhaseController:
+        # Bridge: ChunkACPolicyConfig.phase_mode encodes the deploy policy
+        # (always_rl / always_vla / manual). PhaseController itself only
+        # accepts manual or learned (= how transitions happen). For
+        # always_* we still use manual mode and just pin the initial phase.
+        mode = self.config.phase_mode
+        if mode == "always_rl":
+            ctrl = PhaseController(mode="manual")
+            ctrl.trigger_critical()
+            return ctrl
+        if mode == "always_vla":
+            ctrl = PhaseController(mode="manual")
+            ctrl.trigger_vla()
+            return ctrl
+        if mode == "manual":
+            return PhaseController(mode="manual")
+        raise ValueError(f"Unknown phase_mode: {mode!r}")
 
     def _compute_num_image_tokens(self) -> int:
         pi05 = self._rl_token_policy._pi05
