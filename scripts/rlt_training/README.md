@@ -16,11 +16,15 @@ This directory contains training-time entry points only.
 
 ## Experiment entry points
 
-- `search_rl_token.py`: RL token architecture search.
-- `search_chunk_actor_critic_phase1.py`: actor-critic phase-1 search.
-- `search_chunk_actor_critic_phase2.py`: actor-critic phase-2 search.
-- `search_chunk_actor_critic_phase3.py`: actor-critic phase-3 search.
-- `search_chunk_actor_critic_cp.py`: actor-critic search on critical-phase transition caches.
+All architecture search and sweep evaluation tooling lives under `search/`:
+
+- `search/search_rl_token.py`: RL token architecture search.
+- `search/search_chunk_actor_critic_phase1.py`: actor-critic phase-1 search.
+- `search/search_chunk_actor_critic_phase2.py`: actor-critic phase-2 search.
+- `search/search_chunk_actor_critic_phase3.py`: actor-critic phase-3 search.
+- `search/search_chunk_actor_critic_cp.py`: actor-critic search on critical-phase transition caches.
+- `search/eval_ref_dropped_mse.py`: re-eval AC ckpts to extract ref_dropped_mse.
+- `search/sweeps/`: JSON sweep configs consumed by the search scripts.
 
 ## Shared module
 
