@@ -5,24 +5,26 @@ from typing import Any
 import torch
 
 from lerobot.policies.rlt.configuration_rlt_ac import ChunkACPolicyConfig
+from lerobot.policies.rlt.processor_rlt_common import load_sft_pi05_processors
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.processor.converters import (
-    policy_action_to_transition,
-    transition_to_policy_action,
-)
-from lerobot.utils.constants import (
-    POLICY_POSTPROCESSOR_DEFAULT_NAME,
-    POLICY_PREPROCESSOR_DEFAULT_NAME,
-)
+from lerobot.utils.constants import POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def _identity_to_transition(batch):
-    """Pass the precomputed-chunk-transition dict through unchanged."""
-    return batch
+class _BypassOnChunkTransitionPipeline(PolicyProcessorPipeline[dict[str, Any], dict[str, Any]]):
+    """Short-circuit on precomputed chunk-transition training batches.
 
+    ChunkTransitionDataset emits dicts already encoded through pi05 + RL Token;
+    those dicts lack the raw observation keys the pi05 steps expect. The
+    ``state_vec`` sentinel lets training bypass every step without losing the
+    saved pi05 JSON that ``lerobot-record`` reloads at deploy. At deploy,
+    ``PolicyProcessorPipeline.from_pretrained`` returns a vanilla pipeline (this
+    subclass is not preserved), so the full pi05 step list runs.
+    """
 
-def _identity_to_output(transition):
-    return transition
+    def __call__(self, data: Any) -> Any:
+        if isinstance(data, dict) and "state_vec" in data:
+            return data
+        return super().__call__(data)
 
 
 def make_rlt_ac_pre_post_processors(
@@ -32,28 +34,17 @@ def make_rlt_ac_pre_post_processors(
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
-    """Training-time processor pipeline for ChunkACPolicy.
+    """Deploy-parity AC pre/post-processor pair.
 
-    The dataset (ChunkTransitionDataset) emits precomputed chunk transitions
-    that ChunkACPolicy.forward consumes directly. There is nothing to
-    normalize, tokenize, or pad — bypass all built-in processor logic by
-    returning a no-step pipeline whose to_transition/to_output are identity.
-
-    For deploy-time observation preprocessing, lerobot-record loads the SFT
-    pi05 preprocessor directly from the pi0.5 ckpt dir referenced by
-    config.vla_pretrained_path. The AC ckpt does not carry a pi05 pipeline.
+    The saved preprocessor JSON is byte-identical to the SFT pi05's (modulo
+    the portable tokenizer override) so ``lerobot-record --policy.path=<ac>``
+    reproduces SFT QUANTILES normalization on raw observations. ``dataset_stats``
+    is part of the factory protocol but ignored — the SFT stats are authoritative.
     """
-    return (
-        PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-            steps=[],
-            name=POLICY_PREPROCESSOR_DEFAULT_NAME,
-            to_transition=_identity_to_transition,
-            to_output=_identity_to_output,
-        ),
-        PolicyProcessorPipeline[PolicyAction, PolicyAction](
-            steps=[],
-            name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
-            to_transition=policy_action_to_transition,
-            to_output=transition_to_policy_action,
-        ),
+    del dataset_stats
+    pi05_pre, pi05_post = load_sft_pi05_processors(config.vla_pretrained_path)
+    bypass_pre = _BypassOnChunkTransitionPipeline(
+        steps=list(pi05_pre.steps),
+        name=POLICY_PREPROCESSOR_DEFAULT_NAME,
     )
+    return bypass_pre, pi05_post
