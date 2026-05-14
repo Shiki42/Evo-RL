@@ -8,9 +8,12 @@ so it works in fully headless SSH / tmux / systemd sessions with no TTY,
 no X server, and no window focus. Any process that can open the event node
 receives key events regardless of who "owns" the foreground.
 
-Defaults target the two LinTx pedals on zhaobo-4090-1 (serial-based
-``/dev/input/by-id`` symlinks, stable across USB re-plug). Override via the
-``devices`` argument to adapt to other machines.
+Defaults auto-discover all LinTx pedals (vendor 8088, product 0015) via
+``/dev/input/by-id/usb-LinTx_LinTx_Keyboard_*-if01-event-kbd`` symlinks,
+which are stable across USB re-plug. Per-machine udev rules assign roles
+by serial (e.g. one pedal remapped to KEY_R, the other emitting KEY_SPACE);
+this layer is machine-agnostic. Override via the ``devices`` argument when
+needed.
 
 Requirements:
     - ``pip install evdev``
@@ -19,6 +22,7 @@ Requirements:
 """
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import select
@@ -27,13 +31,12 @@ from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
-# Stable symlinks for the LinTx pedals on zhaobo-4090-1.
-# Pedal A is remapped via udev (KEYBOARD_KEY_7002c=r) to emit KEY_R;
-# Pedal B stays on KEY_SPACE. Both devices expose input interface 1 as the keyboard HID.
-DEFAULT_PEDAL_DEVICES: tuple[str, ...] = (
-    "/dev/input/by-id/usb-LinTx_LinTx_Keyboard_BE1072C8-if01-event-kbd",
-    "/dev/input/by-id/usb-LinTx_LinTx_Keyboard_BE136B2F-if01-event-kbd",
-)
+LINTX_PEDAL_GLOB = "/dev/input/by-id/usb-LinTx_LinTx_Keyboard_*-if01-event-kbd"
+
+
+def discover_pedal_devices() -> tuple[str, ...]:
+    """Enumerate LinTx foot-pedal event nodes by stable by-id symlink."""
+    return tuple(sorted(glob.glob(LINTX_PEDAL_GLOB)))
 
 
 class PedalListener:
@@ -63,7 +66,7 @@ class PedalListener:
     ) -> None:
         self._on_press = on_press
         self._device_paths: tuple[str, ...] = (
-            tuple(devices) if devices is not None else DEFAULT_PEDAL_DEVICES
+            tuple(devices) if devices is not None else discover_pedal_devices()
         )
         # Import deferred to avoid hard dependency at module import time.
         from evdev import ecodes
