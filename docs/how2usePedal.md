@@ -166,15 +166,21 @@ if not listener.start():
 # listener.stop()  # 可选；daemon 线程会随进程退出
 ```
 
-**自定义设备路径**（换机器时）：
+**默认行为：自动发现**。不传 `devices=` 时，`PedalListener` 用 glob 扫 `/dev/input/by-id/usb-LinTx_LinTx_Keyboard_*-if01-event-kbd`，拾取所有当前连接的 LinTx 踏板。换机器、加/减踏板都**不用改代码**——udev 规则在内核层按 serial 分配 R/SPACE 角色，Python 层只看到 `KEY_R` / `KEY_SPACE` 事件。
+
+确认 discovery 会拾到哪些设备：
+
+```python
+from lerobot.utils.pedal_listener import discover_pedal_devices
+print(discover_pedal_devices())
+```
+
+**显式 override**（仅当用非 LinTx 硬件，或想忽略某只 LinTx 踏板）：
 
 ```python
 listener = PedalListener(
     on_press=on_pedal,
-    devices=(
-        "/dev/input/by-id/usb-LinTx_LinTx_Keyboard_<serial1>-if01-event-kbd",
-        "/dev/input/by-id/usb-LinTx_LinTx_Keyboard_<serial2>-if01-event-kbd",
-    ),
+    devices=("/dev/input/by-id/usb-<vendor>_<product>_<serial>-if01-event-kbd",),
 )
 ```
 
@@ -337,7 +343,8 @@ udev 规则里用 `KERNELS=="1-5.2"` / `KERNELS=="1-5.3"` 匹配。缺点：换 
 
 ## 7. 文件索引
 
-- `src/lerobot/utils/pedal_listener.py` — 通用 `PedalListener` 类
+- `src/lerobot/utils/pedal_listener.py` — 通用 `PedalListener` 类 + `discover_pedal_devices()`（默认 glob 自动发现）
+- `tests/utils/test_pedal_listener.py` — discovery + 显式 override 行为的单元测试
 - `src/lerobot/utils/control_utils.py::_start_pedal_listener` — lerobot 集成层
 - `src/lerobot/utils/control_utils.py::init_keyboard_listener` — 自动挂载点（无条件调用）
 - `/etc/udev/rules.d/90-lintx-pedal-remap.rules` — 部署机器上的 udev 规则（不在 git 里，每台机器单独写）
