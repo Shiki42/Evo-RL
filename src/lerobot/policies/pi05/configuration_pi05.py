@@ -100,6 +100,11 @@ class PI05Config(PreTrainedConfig):
     # Placeholder for forward-compat with SFT train_config.json from lerobot 0.5.x.
     # SFT was trained with use_relative_actions=False; no semantic implementation on this fork.
     use_relative_actions: bool = False
+    # Joint names to exclude from relative-mode action denormalization. Not consumed by this fork,
+    # kept for config.json forward-compat (newer lerobot pi05 uses it to keep gripper absolute).
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Populated by newer lerobot pi05 from dataset metadata; loaded as-is here for forward-compat.
+    action_feature_names: list[str] | None = None
 
     def __post_init__(self):
         super().__post_init__()

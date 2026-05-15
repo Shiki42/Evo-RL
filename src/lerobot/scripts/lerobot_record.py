@@ -63,9 +63,11 @@ lerobot-record \
 """
 
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
+from typing import Any
 
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
@@ -76,14 +78,25 @@ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraCon
 from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts, write_info
+from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
-from lerobot.processor import make_default_processors
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import make_robot_action
+from lerobot.processor import (
+    PolicyAction,
+    PolicyProcessorPipeline,
+    RobotAction,
+    RobotObservation,
+    RobotProcessorPipeline,
+    make_default_processors,
+)
 from lerobot.processor.rename_processor import rename_stats
 from lerobot.robots import (  # noqa: F401
+    Robot,
     RobotConfig,
     bi_openarm_follower,
     bi_piper_follower,
@@ -99,14 +112,8 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1 as unitree_g1_robot,
 )
-from lerobot.scripts.recording_hil import (
-    ACPInferenceConfig,
-    PolicySyncDualArmExecutor,
-    _capture_policy_runtime_state,  # noqa: F401
-    _predict_policy_action_with_acp_inference,  # noqa: F401
-)
-from lerobot.scripts.recording_loop import record_loop
 from lerobot.teleoperators import (  # noqa: F401
+    Teleoperator,
     TeleoperatorConfig,
     bi_openarm_leader,
     bi_piper_leader,
@@ -121,29 +128,24 @@ from lerobot.teleoperators import (  # noqa: F401
     so_leader,
     unitree_g1,
 )
+from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
+    predict_action,
     sanity_check_bimanual_piper_pair,
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.recording_annotations import (
-    COLLECTOR_HUMAN,
-    COLLECTOR_POLICY,
-    RLT_COLLECTOR_POLICY_ID_TO_NAME,
-    infer_collector_policy_version,
-    normalize_episode_success_label,
-    resolve_episode_success_label,
-)
+from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import (
     get_safe_torch_device,
     init_logging,
     log_say,
 )
-from lerobot.utils.visualization_utils import init_rerun
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
 @dataclass
@@ -170,74 +172,20 @@ class DatasetRecordConfig:
     private: bool = False
     # Add tags to your dataset on the hub.
     tags: list[str] | None = None
-    # Number of subprocesses handling the saving of frames as PNG. Set to 0 to use threads only;
-    # set to ≥1 to use subprocesses, each using threads to write images. The best number of processes
-    # and threads depends on your system. We recommend 4 threads per camera with 0 processes.
-    # If fps is unstable, adjust the thread count. If still unstable, try using 1 or more subprocesses.
+    # Number of subprocesses handling the saving of frames as PNG.
     num_image_writer_processes: int = 0
     # Number of threads writing the frames as png images on disk, per camera.
-    # Too many threads might cause unstable teleoperation fps due to main thread being blocked.
-    # Not enough threads might cause low camera fps.
     num_image_writer_threads_per_camera: int = 4
-    # Number of episodes to record before batch encoding videos
-    # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
+    # Number of episodes to record before batch encoding videos.
     video_encoding_batch_size: int = 1
     # Video codec for encoding videos. Options: 'h264', 'hevc', 'libsvtav1'.
-    # Use 'h264' for faster encoding on systems where AV1 encoding is CPU-heavy.
     vcodec: str = "libsvtav1"
-    # Rename map for the observation to override the image and state keys
+    # Rename map for the observation to override the image and state keys.
     rename_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.single_task is None:
             raise ValueError("You need to provide a task as argument in `single_task`.")
-
-
-@dataclass
-class RLTRecordConfig:
-    enable: bool = False
-    critical_phase_toggle_key: str = "p"
-    default_reset_mode: str = "full"
-    # RLT deploy settings (used when enable=True)
-    vla_model: str = ""
-    rl_token_ckpt: str = ""
-    ac_ckpt: str = ""
-    task_instruction: str = ""
-    phase_mode: str = "manual"
-    device: str = "cuda"
-    chunk_length: int = 10
-    chunk_exec_steps: int = 25
-    token_pool_size: int = 64
-    image_only: bool = False
-    deterministic: bool = True
-    actor_hidden_dim: int = 256
-    actor_num_layers: int = 3
-    actor_residual: bool = True
-    actor_activation: str = "relu"
-    actor_layer_norm: bool = False
-    # Keyboard keys for RLT HIL mode
-    rl_phase_key: str = "r"
-    end_success_key: str = "s"
-    end_failure_key: str = "f"
-    # wo_prefix mode: drop frames captured during PHASE_PREFIX (before RL phase
-    # starts). Used when the dataset should only contain the RL-driven segment.
-    skip_prefix_recording: bool = False
-    # wo_prefix mode: rl_phase_key toggles — first press starts the episode (and
-    # RL phase), second press ends the episode (sets exit_early). Single end
-    # press marks the episode as success; a follow-up press inside
-    # `rl_phase_double_tap_window_s` marks it as failure.
-    rl_phase_key_toggles_episode: bool = False
-    # With-prefix mode: rl_phase_key toggles the critical phase only — first
-    # press starts RL, second press ends RL and marks the critical phase
-    # (success by default, failure if a second press lands inside the
-    # double-tap window). Episode keeps going in VLA mode afterwards.
-    rl_phase_key_toggles_critical_phase: bool = False
-    rl_phase_double_tap_window_s: float = 0.6
-    # wo_prefix mode: start each episode in human-teleop state (leader drives
-    # follower, no policy actions sent) until the user presses the rl_phase_key
-    # to enter RL. Required for pure RL-only HIL recording where VLA should
-    # never drive the robot.
-    start_in_teleop: bool = False
 
 
 @dataclass
@@ -254,56 +202,13 @@ class RecordConfig:
     display_ip: str | None = None
     # Port of the remote Rerun server
     display_port: int | None = None
-    # Whether to  display compressed images in Rerun
+    # Whether to display compressed images in Rerun
     display_compressed_images: bool = False
     # Use vocal synthesis to read events.
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
-    # In policy mode, broadcast the same robot action to the teleop arm via `teleop.send_feedback`.
-    policy_sync_to_teleop: bool = False
-    # Use parallel dispatch to reduce action broadcast latency when syncing policy to teleop.
-    policy_sync_parallel: bool = True
-    # Enable S0/S1/S2 intervention state machine when policy + teleop are both available.
-    intervention_state_machine_enabled: bool = True
-    # Keyboard key used to toggle entering/leaving intervention.
-    intervention_toggle_key: str = "i"
-    # Pure-teleop mode: r key starts an episode (entering critical phase),
-    # second r press ends the episode and marks it success; a double-tap
-    # inside `rlt.rl_phase_double_tap_window_s` marks it failure. No VLA,
-    # no RL inference, no SPACE intervention — teleop drives the entire
-    # time, r is the only episode-control input. Requires policy to be
-    # None (teleop-only) and reuses the same underlying state machine as
-    # the rlt wo_prefix recorder.
-    teleop_r_key_episodes: bool = False
-    # Whether to capture episode-level success/failure labels from keyboard.
-    enable_episode_outcome_labeling: bool = False
-    # Keyboard key to mark the current episode as success and end it.
-    episode_success_key: str = "s"
-    # Keyboard key to mark the current episode as failure and end it.
-    episode_failure_key: str = "f"
-    # Optional fallback label used when no explicit success/failure key was pressed.
-    default_episode_success: str | None = None
-    # If True, require explicit or default episode labels before saving.
-    require_episode_success_label: bool = False
-    # Unified schema always records step-level collector source ids.
-    enable_collector_policy_id: bool = True
-    # Numeric code used when the executed action comes from the primary policy.
-    collector_policy_id_policy: int = COLLECTOR_POLICY
-    # Numeric code used when the executed action comes from human teleoperation.
-    collector_policy_id_human: int = COLLECTOR_HUMAN
-    # ACP inference controls for policy-driven recording.
-    acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
-    # Retry timeout for transient communication errors (seconds). Set to 0 to fail immediately.
-    communication_retry_timeout_s: float = 2.0
-    # Sleep interval between communication retries (seconds).
-    communication_retry_interval_s: float = 0.1
-    # Enable critical phase labeling via keyboard toggle during recording.
-    enable_critical_phase_labeling: bool = False
-    # Keyboard key for toggling critical phase marking. Default is space.
-    critical_phase_toggle_key: str = " "
-    rlt: RLTRecordConfig = field(default_factory=RLTRecordConfig)
-    # Path to a JSON file with robot + camera config (e.g. roboclaw setup.json).
+    # Path to a JSON file with robot + camera config (e.g. roboclaw manifest.json).
     # When set, overrides robot port and camera CLI args.
     robot_config_file: str | None = None
 
@@ -322,91 +227,9 @@ class RecordConfig:
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
 
-        # When RLT is enabled, translate RLT config into a standard RLT policy config
-        if self.rlt.enable and self.rlt.vla_model and self.policy is None:
-            from lerobot.policies.rlt.configuration_rlt import RLTPretrainedConfig
-
-            self.policy = RLTPretrainedConfig(
-                vla_pretrained_path=self.rlt.vla_model,
-                rl_token_ckpt_path=self.rlt.rl_token_ckpt,
-                ac_ckpt_path=self.rlt.ac_ckpt,
-                task_instruction=self.rlt.task_instruction or self.dataset.single_task,
-                phase_mode=self.rlt.phase_mode,
-                device=self.rlt.device,
-                chunk_length=self.rlt.chunk_length,
-                chunk_exec_steps=self.rlt.chunk_exec_steps,
-                token_pool_size=self.rlt.token_pool_size,
-                image_only=self.rlt.image_only,
-                deterministic=self.rlt.deterministic,
-                actor_hidden_dim=self.rlt.actor_hidden_dim,
-                actor_num_layers=self.rlt.actor_num_layers,
-                actor_residual=self.rlt.actor_residual,
-                actor_activation=self.rlt.actor_activation,
-                actor_layer_norm=self.rlt.actor_layer_norm,
-            )
-            # preprocessor/postprocessor come from VLA model directory
-            self.policy.pretrained_path = self.rlt.vla_model
-
         if self.teleop is None and self.policy is None:
-            raise ValueError("Choose a policy, a teleoperator, or enable RLT to control the robot")
+            raise ValueError("Choose a policy, a teleoperator or both to control the robot")
         sanity_check_bimanual_piper_pair(self.robot, self.teleop)
-        if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
-            raise ValueError("`intervention_toggle_key` must be a single character.")
-
-        if self.enable_episode_outcome_labeling:
-            label_key_bindings = {
-                "episode_success_key": self.episode_success_key,
-                "episode_failure_key": self.episode_failure_key,
-            }
-            for key_name, key_value in label_key_bindings.items():
-                if not key_value or len(key_value) != 1:
-                    raise ValueError(f"`{key_name}` must be a single character.")
-
-            normalized_keys = [
-                self.intervention_toggle_key.lower(),
-                self.episode_success_key.lower(),
-                self.episode_failure_key.lower(),
-            ]
-            if len(set(normalized_keys)) != len(normalized_keys):
-                raise ValueError(
-                    "`intervention_toggle_key`, `episode_success_key`, and `episode_failure_key` must be distinct."
-                )
-
-        if self.rlt.enable:
-            if not self.rlt.critical_phase_toggle_key or len(self.rlt.critical_phase_toggle_key) != 1:
-                raise ValueError("`rlt.critical_phase_toggle_key` must be a single character.")
-
-            reserved_keys = [
-                self.rlt.critical_phase_toggle_key.lower(),
-                self.intervention_toggle_key.lower(),
-            ]
-            if self.enable_episode_outcome_labeling:
-                reserved_keys.append(self.episode_success_key.lower())
-                reserved_keys.append(self.episode_failure_key.lower())
-            if len(set(reserved_keys)) != len(reserved_keys):
-                raise ValueError(
-                    "`rlt.critical_phase_toggle_key` must not collide with intervention or episode outcome keys."
-                )
-
-        if self.default_episode_success is not None:
-            self.default_episode_success = normalize_episode_success_label(self.default_episode_success)
-
-        if not self.enable_collector_policy_id:
-            raise ValueError("`enable_collector_policy_id` must stay true for the unified recording schema.")
-        if self.collector_policy_id_human < 0:
-            raise ValueError("`collector_policy_id_human` must be >= 0.")
-        if self.collector_policy_id_policy < 0:
-            raise ValueError("`collector_policy_id_policy` must be >= 0.")
-        if self.collector_policy_id_human == self.collector_policy_id_policy:
-            raise ValueError("`collector_policy_id_human` and `collector_policy_id_policy` must be distinct.")
-        if self.acp_inference.use_cfg and not self.acp_inference.enable:
-            raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
-        if self.acp_inference.cfg_beta < 0:
-            raise ValueError("`acp_inference.cfg_beta` must be >= 0.")
-        if self.communication_retry_timeout_s < 0:
-            raise ValueError("`communication_retry_timeout_s` must be >= 0.")
-        if self.communication_retry_interval_s <= 0:
-            raise ValueError("`communication_retry_interval_s` must be > 0.")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -414,75 +237,179 @@ class RecordConfig:
         return ["policy"]
 
 
-def _ensure_human_inloop_compatible_features(
-    dataset_features: dict[str, dict],
-    *,
-    action_feature_names: list[str],
-) -> None:
-    # Unified annotation schema shared by future recorded datasets.
-    dataset_features["complementary_info.policy_action"] = {
-        "dtype": "float32",
-        "shape": (len(action_feature_names),),
-        "names": action_feature_names,
-    }
-    dataset_features["complementary_info.is_intervention"] = {
-        "dtype": "float32",
-        "shape": (1,),
-        "names": ["is_intervention"],
-    }
-    dataset_features["complementary_info.state"] = {
-        "dtype": "float32",
-        "shape": (1,),
-        "names": ["state"],
-    }
-    dataset_features["complementary_info.phase"] = {"dtype": "float32", "shape": (1,), "names": ["phase"]}
+""" --------------- record_loop() data flow --------------------------
+       [ Robot ]
+           V
+     [ robot.get_observation() ] ---> raw_obs
+           V
+     [ robot_observation_processor ] ---> processed_obs
+           V
+     .-----( ACTION LOGIC )------------------.
+     V                                       V
+     [ From Teleoperator ]                   [ From Policy ]
+     |                                       |
+     |  [teleop.get_action] -> raw_action    |   [predict_action]
+     |          |                            |          |
+     |          V                            |          V
+     | [teleop_action_processor]             |          |
+     |          |                            |          |
+     '---> processed_teleop_action           '---> processed_policy_action
+     |                                       |
+     '-------------------------.-------------'
+                               V
+                  [ robot_action_processor ] --> robot_action_to_send
+                               V
+                    [ robot.send_action() ] -- (Robot Executes)
+                               V
+                    ( Save to Dataset )
+                               V
+                  ( Rerun Log / Loop Wait )
+"""
 
 
-def _add_collector_policy_id_feature(dataset_features: dict[str, dict]) -> None:
-    dataset_features["complementary_info.collector_policy_id"] = {
-        "dtype": "int64",
-        "shape": (1,),
-        "names": ["collector_policy_id"],
-    }
+@safe_stop_image_writer
+def record_loop(
+    robot: Robot,
+    events: dict,
+    fps: int,
+    teleop_action_processor: RobotProcessorPipeline[
+        tuple[RobotAction, RobotObservation], RobotAction
+    ],
+    robot_action_processor: RobotProcessorPipeline[
+        tuple[RobotAction, RobotObservation], RobotAction
+    ],
+    robot_observation_processor: RobotProcessorPipeline[
+        RobotObservation, RobotObservation
+    ],
+    dataset: LeRobotDataset | None = None,
+    teleop: Teleoperator | list[Teleoperator] | None = None,
+    policy: PreTrainedPolicy | None = None,
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
+    control_time_s: int | None = None,
+    single_task: str | None = None,
+    display_data: bool = False,
+    display_compressed_images: bool = False,
+):
+    if dataset is not None and dataset.fps != fps:
+        raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
+    teleop_arm = teleop_keyboard = None
+    if isinstance(teleop, list):
+        teleop_keyboard = next((t for t in teleop if isinstance(t, KeyboardTeleop)), None)
+        teleop_arm = next(
+            (
+                t
+                for t in teleop
+                if isinstance(
+                    t,
+                    (
+                        so_leader.SO100Leader
+                        | so_leader.SO101Leader
+                        | koch_leader.KochLeader
+                        | omx_leader.OmxLeader
+                    ),
+                )
+            ),
+            None,
+        )
 
-def _build_collector_policy_id_codebook(cfg: RecordConfig) -> dict[str, str]:
-    if cfg.rlt.enable:
-        return {str(code): name for code, name in RLT_COLLECTOR_POLICY_ID_TO_NAME.items()}
-    if cfg.policy is None:
-        return {str(cfg.collector_policy_id_human): "human"}
-    return {
-        str(cfg.collector_policy_id_human): "human",
-        str(cfg.collector_policy_id_policy): infer_collector_policy_version(cfg.policy),
-    }
+        if not (teleop_arm and teleop_keyboard and len(teleop) == 2 and robot.name == "lekiwi_client"):
+            raise ValueError(
+                "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
+            )
 
+    if policy is not None and preprocessor is not None and postprocessor is not None:
+        policy.reset()
+        preprocessor.reset()
+        postprocessor.reset()
 
-def _write_schema_metadata(
-    dataset: LeRobotDataset,
-    *,
-    collector_policy_id_codebook: dict[str, str],
-    include_rlt_episode_metadata: bool,
-) -> None:
-    collector_info = dataset.meta.info["features"].get("complementary_info.collector_policy_id")
-    if collector_info is None:
-        return
-    collector_info["info"] = {"codebook": collector_policy_id_codebook}
-    if include_rlt_episode_metadata:
-        dataset.meta.info["rlt_episode_metadata_fields"] = {
-            "rl_intervals": "List of {start_frame, end_frame, outcome} for each RL phase.",
-            "human_intervention_intervals": "List of {start_frame, end_frame} for each human intervention segment.",
-        }
-    dataset.meta.info["recording_schema_version"] = 2
-    write_info(dataset.meta.info, dataset.root)
+    no_action_count = 0
+    timestamp = 0
+    start_episode_t = time.perf_counter()
+    while timestamp < control_time_s:
+        start_loop_t = time.perf_counter()
+
+        if events["exit_early"]:
+            events["exit_early"] = False
+            break
+
+        obs = robot.get_observation()
+        obs_processed = robot_observation_processor(obs)
+
+        if policy is not None or dataset is not None:
+            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+
+        if policy is not None and preprocessor is not None and postprocessor is not None:
+            action_values = predict_action(
+                observation=observation_frame,
+                policy=policy,
+                device=get_safe_torch_device(policy.config.device),
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                use_amp=policy.config.use_amp,
+                task=single_task,
+                robot_type=robot.robot_type,
+            )
+            act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+            action_values = robot_action_to_send
+
+        elif policy is None and isinstance(teleop, Teleoperator):
+            act = teleop.get_action()
+            if robot.name == "unitree_g1":
+                teleop.send_feedback(obs)
+
+            act_processed_teleop = teleop_action_processor((act, obs))
+            action_values = act_processed_teleop
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
+        elif policy is None and isinstance(teleop, list):
+            arm_action = teleop_arm.get_action()
+            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+            keyboard_action = teleop_keyboard.get_action()
+            base_action = robot._from_keyboard_to_base_action(keyboard_action)
+            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+            act_processed_teleop = teleop_action_processor((act, obs))
+            action_values = act_processed_teleop
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+        else:
+            no_action_count += 1
+            if no_action_count == 1 or no_action_count % 10 == 0:
+                logging.warning(
+                    "No policy or teleoperator provided, skipping action generation. "
+                    "This is likely to happen when resetting the environment without a teleop device. "
+                    "The robot won't be at its rest position at the start of the next episode."
+                )
+            continue
+
+        _sent_action = robot.send_action(robot_action_to_send)
+
+        if dataset is not None:
+            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+            frame = {**observation_frame, **action_frame, "task": single_task}
+            dataset.add_frame(frame)
+
+        if display_data:
+            log_rerun_data(
+                observation=obs_processed, action=action_values, compress_images=display_compressed_images
+            )
+
+        dt_s = time.perf_counter() - start_loop_t
+        sleep_time_s: float = 1 / fps - dt_s
+        if sleep_time_s < 0:
+            logging.warning(
+                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+            )
+
+        precise_sleep(max(sleep_time_s, 0.0))
+
+        timestamp = time.perf_counter() - start_episode_t
 
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
-    if cfg.require_episode_success_label and not cfg.enable_episode_outcome_labeling:
-        raise ValueError(
-            "`require_episode_success_label=true` requires `enable_episode_outcome_labeling=true`."
-        )
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
@@ -500,9 +427,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
             pipeline=teleop_action_processor,
-            initial_features=create_initial_features(
-                action=robot.action_features
-            ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
+            initial_features=create_initial_features(action=robot.action_features),
             use_videos=cfg.dataset.video,
         ),
         aggregate_pipeline_dataset_features(
@@ -511,17 +436,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             use_videos=cfg.dataset.video,
         ),
     )
-    action_names = dataset_features[ACTION]["names"]
-    action_names = list(robot.action_features) if action_names is None else list(action_names)
-    _ensure_human_inloop_compatible_features(dataset_features, action_feature_names=action_names)
-    if cfg.enable_collector_policy_id:
-        _add_collector_policy_id_feature(dataset_features)
 
     dataset = None
     listener = None
-    policy_sync_executor = None
-    critical_phase_tracker = None
-    intervention_tracker = None
 
     try:
         if cfg.resume:
@@ -539,7 +456,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
             sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
-            # Create empty dataset or load existing saved episodes
             sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,
@@ -553,18 +469,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
             )
-        _write_schema_metadata(
-            dataset,
-            collector_policy_id_codebook=_build_collector_policy_id_codebook(cfg),
-            include_rlt_episode_metadata=cfg.rlt.enable,
-        )
 
-        # Load pretrained policy
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
         preprocessor = None
         postprocessor = None
-        if cfg.acp_inference.enable and cfg.policy is None:
-            raise ValueError("`acp_inference.enable=true` requires `policy` to be set.")
         if cfg.policy is not None:
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
@@ -576,118 +484,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 },
             )
 
-        collector_policy_id_policy = cfg.collector_policy_id_policy
-        collector_policy_id_human = cfg.collector_policy_id_human
-
         robot.connect()
         if teleop is not None:
             teleop.connect()
-        on_record_connected = getattr(cfg, "_on_record_connected", None)
-        if callable(on_record_connected):
-            on_record_connected(robot, teleop)
 
-        if cfg.policy_sync_to_teleop:
-            if cfg.policy is None:
-                raise ValueError("`policy_sync_to_teleop=true` requires `policy` to be set.")
-            if teleop is None or isinstance(teleop, list):
-                raise ValueError(
-                    "`policy_sync_to_teleop=true` requires exactly one teleoperator with send_feedback support."
-                )
-            policy_sync_executor = PolicySyncDualArmExecutor(
-                robot=robot,
-                teleop=teleop,
-                parallel_dispatch=cfg.policy_sync_parallel,
-            )
-
-        critical_phase_tracker = None
-        teleop_r_key_mode = cfg.teleop_r_key_episodes and policy is None
-        if (
-            cfg.enable_critical_phase_labeling
-            or (cfg.rlt.enable and cfg.rlt.vla_model)
-            or teleop_r_key_mode
-        ):
-            from lerobot.utils.critical_phase_tracker import CriticalPhaseTracker, EpisodeIntervalTracker
-
-            critical_phase_tracker = CriticalPhaseTracker(
-                auto_save_path=dataset.root / "critical_phase_intervals.json",
-            )
-            if cfg.rlt.enable:
-                intervention_tracker = EpisodeIntervalTracker(label="Human intervention")
-
-        # RLT policy is now a standard PreTrainedPolicy — no separate instantiation needed
-
-        cp_key = cfg.critical_phase_toggle_key if cfg.enable_critical_phase_labeling else None
-        if cp_key is None and cfg.rlt.enable:
-            cp_key = cfg.rlt.critical_phase_toggle_key
-
-        # RLT HIL mode: use SPACE for intervention, r/s/f for phase control
-        rlt_hil_mode = cfg.rlt.enable and policy is not None and teleop is not None
-        rlt_active = cfg.rlt.enable and policy is not None
-        if rlt_active:
-            rl_phase_key_binding = cfg.rlt.rl_phase_key
-        elif teleop_r_key_mode:
-            rl_phase_key_binding = "r"
-        else:
-            rl_phase_key_binding = None
-        # In teleop_r_key_mode the r key is the single episode-control input;
-        # unbind s/f so the user cannot accidentally end an episode out of
-        # the double-tap state machine.
-        bind_ep_outcome_keys = cfg.enable_episode_outcome_labeling and not teleop_r_key_mode
-        listener, events = init_keyboard_listener(
-            intervention_toggle_key=" " if rlt_hil_mode else cfg.intervention_toggle_key,
-            critical_phase_toggle_key=cp_key if not rlt_active else None,
-            episode_success_key=cfg.episode_success_key if bind_ep_outcome_keys else None,
-            episode_failure_key=cfg.episode_failure_key if bind_ep_outcome_keys else None,
-            cp_success_key="s" if cfg.enable_critical_phase_labeling and not rlt_active else None,
-            cp_failure_key="f" if cfg.enable_critical_phase_labeling and not rlt_active else None,
-            rl_phase_key=rl_phase_key_binding,
-            end_success_key=cfg.rlt.end_success_key if rlt_active else None,
-            end_failure_key=cfg.rlt.end_failure_key if rlt_active else None,
-        )
+        listener, events = init_keyboard_listener()
 
         with VideoEncodingManager(dataset):
-            # One-time RL-path warmup so the first r press pays no cold-start
-            # cost (CUDA kernel compile, KV cache alloc, buffer layout). The
-            # warmup is driven through set_rl_mode() so the rlt policy
-            # exercises the RL actor codepath — VLA prefix forward runs only
-            # to produce prefix tokens (consumed by the RL token encoder),
-            # no VLA action chunk is ever queued or sent.
-            if rlt_active and policy is not None and preprocessor is not None and postprocessor is not None:
-                log_say("Warming up RL path", cfg.play_sounds)
-                _warmup_obs = robot.get_observation()
-                _warmup_obs_processed = robot_observation_processor(_warmup_obs)
-                _warmup_frame = build_dataset_frame(
-                    dataset.features, _warmup_obs_processed, prefix=OBS_STR
-                )
-                if hasattr(policy, "set_rl_mode"):
-                    policy.set_rl_mode()
-                _predict_policy_action_with_acp_inference(
-                    observation_frame=_warmup_frame,
-                    policy=policy,
-                    device=get_safe_torch_device(policy.config.device),
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    use_amp=policy.config.use_amp,
-                    task=cfg.dataset.single_task,
-                    robot_type=robot.robot_type,
-                    acp_inference=cfg.acp_inference,
-                )
-                # Leave the policy in RL mode. recording_loop will call
-                # policy.reset() at episode start which resets the phase
-                # controller, so this only affects the warmup-to-first-reset
-                # gap where policy is never invoked.
-                log_say("Ready", cfg.play_sounds)
-
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                events["episode_outcome"] = None
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-                if critical_phase_tracker is not None:
-                    critical_phase_tracker.on_episode_start(dataset.num_episodes)
-                if intervention_tracker is not None:
-                    intervention_tracker.on_episode_start(dataset.num_episodes)
-                if policy is not None and hasattr(policy, "set_rl_mode"):
-                    policy.reset()
                 record_loop(
                     robot=robot,
                     events=events,
@@ -704,65 +510,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
-                    policy_sync_executor=policy_sync_executor,
-                    intervention_state_machine_enabled=cfg.intervention_state_machine_enabled,
-                    collector_policy_id_policy=collector_policy_id_policy,
-                    collector_policy_id_human=collector_policy_id_human,
-                    acp_inference=cfg.acp_inference,
-                    communication_retry_timeout_s=cfg.communication_retry_timeout_s,
-                    communication_retry_interval_s=cfg.communication_retry_interval_s,
-                    critical_phase_tracker=critical_phase_tracker,
-                    rlt_intervention_tracker=intervention_tracker,
-                    skip_prefix_recording=cfg.rlt.skip_prefix_recording or teleop_r_key_mode,
-                    rl_phase_key_toggles_episode=cfg.rlt.rl_phase_key_toggles_episode or teleop_r_key_mode,
-                    rl_phase_key_toggles_critical_phase=cfg.rlt.rl_phase_key_toggles_critical_phase,
-                    rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
-                    start_in_teleop=cfg.rlt.start_in_teleop,
                 )
 
-                if critical_phase_tracker is not None:
-                    ep_frames = dataset.episode_buffer["size"] if dataset.episode_buffer else 0
-                    critical_phase_tracker.on_episode_end(ep_frames)
-                if intervention_tracker is not None:
-                    ep_frames = dataset.episode_buffer["size"] if dataset.episode_buffer else 0
-                    intervention_tracker.on_episode_end(ep_frames)
-
-                episode_success = None
-                if cfg.enable_episode_outcome_labeling:
-                    episode_success = resolve_episode_success_label(
-                        explicit_label=events.get("episode_outcome"),
-                        default_label=cfg.default_episode_success,
-                        require_label=cfg.require_episode_success_label,
-                    )
-                    if events.get("episode_outcome") is None and episode_success is not None:
-                        logging.warning(
-                            "Episode %s has no explicit success/failure label, defaulting to '%s'.",
-                            dataset.num_episodes,
-                            episode_success,
-                        )
-
-                on_episode_outcome = getattr(cfg, "_on_record_episode_outcome", None)
-                if callable(on_episode_outcome):
-                    on_episode_outcome(robot, teleop, episode_success)
-
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded.
-                # Also skip entirely in start_in_teleop mode: the next episode
-                # already begins in human-teleop with skip_prefix_recording, so
-                # the user can take as long as they want before pressing r —
-                # there is no functional difference vs the reset loop.
-                if (
-                    not events["stop_recording"]
-                    and not cfg.rlt.start_in_teleop
-                    and not teleop_r_key_mode
-                    and (
-                        (recorded_episodes < cfg.dataset.num_episodes - 1)
-                        or events["rerecord_episode"]
-                    )
+                if not events["stop_recording"] and (
+                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
 
-                    # reset g1 robot
                     if robot.name == "unitree_g1":
                         robot.reset()
 
@@ -777,99 +531,34 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
-                        policy_sync_executor=policy_sync_executor,
-                        intervention_state_machine_enabled=cfg.intervention_state_machine_enabled,
-                        collector_policy_id_policy=collector_policy_id_policy,
-                        collector_policy_id_human=collector_policy_id_human,
-                        acp_inference=cfg.acp_inference,
-                        communication_retry_timeout_s=cfg.communication_retry_timeout_s,
-                        communication_retry_interval_s=cfg.communication_retry_interval_s,
                     )
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
-                    if critical_phase_tracker is not None:
-                        critical_phase_tracker.discard_episode(dataset.num_episodes)
-                    if intervention_tracker is not None:
-                        intervention_tracker.discard_episode(dataset.num_episodes)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
-                    events["episode_outcome"] = None
                     dataset.clear_episode_buffer()
                     continue
 
-                extra_episode_metadata = {}
-                if cfg.enable_episode_outcome_labeling:
-                    extra_episode_metadata["episode_success"] = episode_success
-                if cfg.rlt.enable:
-                    episode_idx = dataset.num_episodes
-                    extra_episode_metadata["rl_intervals"] = (
-                        critical_phase_tracker.serialize_episode_intervals(episode_idx)
-                        if critical_phase_tracker is not None
-                        else []
-                    )
-                    extra_episode_metadata["human_intervention_intervals"] = (
-                        intervention_tracker.serialize_episode_intervals(episode_idx)
-                        if intervention_tracker is not None
-                        else []
-                    )
-                if not extra_episode_metadata:
-                    extra_episode_metadata = None
-                dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
+                dataset.save_episode()
                 recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
         if dataset:
             dataset.finalize()
-            logging.info(
-                "To inspect the recorded dataset, run:\n"
-                "  lerobot-dataset-report --dataset %s",
-                dataset.repo_id,
-            )
-
-        if critical_phase_tracker is not None and len(critical_phase_tracker) > 0:
-            import json
-
-            intervals = critical_phase_tracker.get_intervals()
-            logging.info("Critical phase labeling: %d intervals recorded.", len(intervals))
-            for ep_idx, start, end, outcome in intervals:
-                outcome_str = f" [{outcome}]" if outcome else ""
-                logging.info(
-                    "  Episode %d: frames %d-%d (%d frames)%s",
-                    ep_idx, start, end, end - start, outcome_str,
-                )
-            if dataset is not None:
-                intervals_file = dataset.root / "critical_phase_intervals.json"
-                with open(intervals_file, "w") as f:
-                    json.dump(
-                        [
-                            {"episode_index": ep, "start_frame": s, "end_frame": e, "outcome": o}
-                            for ep, s, e, o in intervals
-                        ],
-                        f,
-                        indent=2,
-                    )
-                logging.info("Critical phase intervals saved to %s", intervals_file)
-
-        if policy_sync_executor is not None:
-            policy_sync_executor.shutdown()
 
         if robot.is_connected:
             robot.disconnect()
         if teleop and teleop.is_connected:
             teleop.disconnect()
 
-        if listener and hasattr(listener, "stop"):
+        if listener and hasattr(listener, "stop") and not is_headless():
             listener.stop()
 
         if cfg.dataset.push_to_hub:
             if dataset is not None:
                 dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
-            else:
-                logging.warning(
-                    "`dataset.push_to_hub=true` was requested, but dataset was not initialized due to an earlier error."
-                )
 
         log_say("Exiting", cfg.play_sounds)
     return dataset
