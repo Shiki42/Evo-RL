@@ -35,7 +35,10 @@ class PI05Config(PreTrainedConfig):
 
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
-    n_action_steps: int = 50  # Number of action steps to execute
+    n_action_steps: int = 25  # Number of action steps to execute
+    chunk_overlap_ensemble_prev_weight: float = 0.0
+    chunk_boundary_bridge_steps: int = 0
+    chunk_boundary_bridge_to_state: bool = False
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -117,6 +120,11 @@ class PI05Config(PreTrainedConfig):
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
+        if not 0.0 <= self.chunk_overlap_ensemble_prev_weight <= 1.0:
+            raise ValueError("chunk_overlap_ensemble_prev_weight must be in [0, 1]")
+
+        if self.chunk_boundary_bridge_steps < 0:
+            raise ValueError("chunk_boundary_bridge_steps must be non-negative")
 
         if self.action_expert_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid action_expert_variant: {self.action_expert_variant}")

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import builtins
+import copy
 import logging
 import math
 from collections import deque
@@ -48,6 +49,7 @@ from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
@@ -148,7 +150,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     mode: str = "bilinear",
 ) -> torch.Tensor:
     """PyTorch version of resize_with_pad. Resizes an image to a target height and width without distortion
-    by padding with black. If the image is float32, it must be in the range [-1, 1].
+    by padding with black. If the image is float32, it must be in the range [0, 1].
 
     Args:
         images: Tensor of shape [*b, h, w, c] or [*b, c, h, w]
@@ -189,7 +191,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     if images.dtype == torch.uint8:
         resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
     elif images.dtype == torch.float32:
-        resized_images = resized_images.clamp(-1.0, 1.0)
+        resized_images = resized_images.clamp(0.0, 1.0)
     else:
         raise ValueError(f"Unsupported image dtype: {images.dtype}")
 
@@ -200,7 +202,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     pad_w1 = pad_w0 + remainder_w
 
     # Pad
-    constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    constant_value = 0 if images.dtype == torch.uint8 else 0.0
     padded_images = F.pad(
         resized_images,
         (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
@@ -951,6 +953,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        past_key_values = copy.deepcopy(past_key_values)
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
@@ -1200,6 +1203,54 @@ class PI05Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._previous_action_chunk = None
+        self._last_selected_action = None
+        self._last_action_debug = {}
+
+    def _apply_chunk_overlap_ensemble(self, actions: Tensor) -> tuple[Tensor, Tensor | None, int]:
+        prev_weight = self.config.chunk_overlap_ensemble_prev_weight
+        if prev_weight == 0.0 or self._previous_action_chunk is None:
+            return actions, None, 0
+
+        overlap_len = min(
+            self.config.n_action_steps,
+            self.config.chunk_size - self.config.n_action_steps,
+            self._previous_action_chunk.shape[1] - self.config.n_action_steps,
+            actions.shape[1],
+        )
+        if overlap_len <= 0:
+            return actions, None, 0
+
+        blended_actions = actions.clone()
+        prev_overlap = self._previous_action_chunk[
+            :, self.config.n_action_steps : self.config.n_action_steps + overlap_len
+        ]
+        blended_actions[:, :overlap_len] = prev_weight * prev_overlap + (1.0 - prev_weight) * actions[
+            :, :overlap_len
+        ]
+        return blended_actions, prev_overlap, overlap_len
+
+    def _bridge_anchor(self, batch: dict[str, Tensor], actions: Tensor) -> Tensor | None:
+        if self._last_selected_action is not None:
+            return self._last_selected_action
+        if not self.config.chunk_boundary_bridge_to_state or OBS_STATE not in batch:
+            return None
+        # First-chunk fallback; assumes state/action normalization spaces are compatible for robot joints.
+        return batch[OBS_STATE][:, : actions.shape[-1]]
+
+    def _apply_chunk_boundary_bridge(self, batch: dict[str, Tensor], actions: Tensor) -> Tensor:
+        bridge_steps = min(self.config.chunk_boundary_bridge_steps, self.config.n_action_steps)
+        anchor = self._bridge_anchor(batch, actions)
+        if bridge_steps == 0 or anchor is None:
+            return actions
+
+        target_index = min(bridge_steps, actions.shape[1] - 1)
+        bridge_target = actions[:, target_index]
+        bridged_actions = actions.clone()
+        for step in range(bridge_steps):
+            ratio = (step + 1) / (bridge_steps + 1)
+            bridged_actions[:, step] = (1.0 - ratio) * anchor + ratio * bridge_target
+        return bridged_actions
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1297,13 +1348,36 @@ class PI05Policy(PreTrainedPolicy):
 
         self.eval()
 
-        # Action queue logic for n_action_steps > 1
+        queue_len_before = len(self._action_queue)
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
-            # Transpose to get shape (n_action_steps, batch_size, action_dim)
-            self._action_queue.extend(actions.transpose(0, 1))
+            raw_actions = self.predict_action_chunk(batch)
+            actions, prev_overlap, overlap_len = self._apply_chunk_overlap_ensemble(raw_actions)
+            actions = self._apply_chunk_boundary_bridge(batch, actions)
+            actions_to_execute = actions[:, : self.config.n_action_steps]
 
-        return self._action_queue.popleft()
+            self._previous_action_chunk = raw_actions.detach().clone()
+            self._last_action_debug = {
+                "is_boundary": True,
+                "queue_len_before": queue_len_before,
+                "overlap_len": overlap_len,
+                "chunk_overlap_ensemble_prev_weight": self.config.chunk_overlap_ensemble_prev_weight,
+                "chunk_boundary_bridge_steps": self.config.chunk_boundary_bridge_steps,
+                "chunk_boundary_bridge_to_state": self.config.chunk_boundary_bridge_to_state,
+                "raw_action0": raw_actions[:, 0].detach(),
+                "executed_action0": actions_to_execute[:, 0].detach(),
+                "previous_overlap_action0": None if prev_overlap is None else prev_overlap[:, 0].detach(),
+                "raw_chunk": raw_actions.detach(),
+                "executed_chunk": actions_to_execute.detach(),
+                "previous_overlap_chunk": None if prev_overlap is None else prev_overlap.detach(),
+            }
+            # Transpose to get shape (n_action_steps, batch_size, action_dim)
+            self._action_queue.extend(actions_to_execute.transpose(0, 1))
+        else:
+            self._last_action_debug = {"is_boundary": False, "queue_len_before": queue_len_before}
+
+        action = self._action_queue.popleft()
+        self._last_selected_action = action.detach().clone()
+        return action
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:

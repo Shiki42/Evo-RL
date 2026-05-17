@@ -62,13 +62,16 @@ lerobot-record \
 ```
 """
 
+import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+import numpy as np
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
@@ -129,7 +132,7 @@ from lerobot.teleoperators import (  # noqa: F401
     unitree_g1,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.constants import ACTION, OBS_STATE, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -324,87 +327,244 @@ def record_loop(
         preprocessor.reset()
         postprocessor.reset()
 
+    action_feature_names = dataset.features[ACTION]["names"] if dataset is not None else None
+    if action_feature_names is None:
+        if isinstance(robot.action_features, dict):
+            action_feature_names = list(robot.action_features.keys())
+        else:
+            action_feature_names = list(robot.action_features)
+
+    def vectorize_action(values: RobotAction | None) -> list[float] | None:
+        if values is None:
+            return None
+        return [float(np.asarray(values[name]).reshape(-1)[0]) for name in action_feature_names]
+
+    def vectorize_state(values: dict[str, Any] | None) -> list[float] | None:
+        if values is None:
+            return None
+        return [float(np.asarray(values[name]).reshape(-1)[0]) for name in action_feature_names]
+
+    def vector_distance(left: list[float] | None, right: list[float] | None) -> dict[str, float] | None:
+        if left is None or right is None:
+            return None
+        diff = np.abs(np.asarray(left, dtype=np.float32) - np.asarray(right, dtype=np.float32))
+        return {"l1": float(diff.sum()), "linf": float(diff.max())}
+
+    def tensor_to_action_vector(value: Any) -> list[float] | None:
+        if value is None or postprocessor is None:
+            return None
+        raw_value = postprocessor(value)
+        if hasattr(raw_value, "detach"):
+            raw_value = raw_value.detach().cpu().numpy()
+        return np.asarray(raw_value, dtype=np.float32).reshape(-1)[: len(action_feature_names)].tolist()
+
+    def tensor_to_action_sequence(value: Any) -> list[list[float]] | None:
+        if value is None or postprocessor is None:
+            return None
+        if value.ndim == 2:
+            value = value.unsqueeze(1)
+        return [tensor_to_action_vector(value[:, step]) for step in range(value.shape[1])]
+
+    def vector_distances(
+        sequence: list[list[float]] | None, right: list[float] | None
+    ) -> list[dict[str, float]] | None:
+        if sequence is None or right is None:
+            return None
+        return [vector_distance(vector, right) for vector in sequence]
+
+    def read_state_before_send() -> dict[str, float] | None:
+        if not (hasattr(robot, "left_arm") and hasattr(robot, "right_arm")):
+            return None
+        state: dict[str, float] = {}
+        for side, arm in (("left", robot.left_arm), ("right", robot.right_arm)):
+            positions = arm.bus.sync_read("Present_Position", num_retry=2)
+            state.update({f"{side}_{motor}.pos": float(value) for motor, value in positions.items()})
+        return state
+
+    action_state_debug_fh = None
+    action_state_debug_path = os.environ.get("LEROBOT_ACTION_STATE_DEBUG_JSONL")
+    include_action_chunks = os.environ.get("LEROBOT_ACTION_STATE_DEBUG_INCLUDE_CHUNKS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if action_state_debug_path and dataset is not None and hasattr(dataset, "root"):
+        if action_state_debug_path.lower() in {"1", "true", "yes"}:
+            debug_path = dataset.root / "action_state_debug.jsonl"
+        else:
+            debug_path = Path(action_state_debug_path).expanduser()
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        action_state_debug_fh = open(debug_path, "a", encoding="utf-8")
+        logging.info("[ActionStateDebug] Writing chunk boundary comparisons to %s", debug_path)
+
+    def write_action_state_debug(row: dict[str, Any]) -> None:
+        if action_state_debug_fh is None:
+            return
+        action_state_debug_fh.write(json.dumps(row) + "\n")
+        action_state_debug_fh.flush()
+
     no_action_count = 0
+    debug_frame_index = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
-    while timestamp < control_time_s:
-        start_loop_t = time.perf_counter()
+    try:
+        while timestamp < control_time_s:
+            start_loop_t = time.perf_counter()
 
-        if events["exit_early"]:
-            events["exit_early"] = False
-            break
+            if events["exit_early"]:
+                events["exit_early"] = False
+                break
 
-        obs = robot.get_observation()
-        obs_processed = robot_observation_processor(obs)
+            obs_t0 = time.perf_counter()
+            obs = robot.get_observation()
+            obs_processed = robot_observation_processor(obs)
+            obs_ms = (time.perf_counter() - obs_t0) * 1000
+            infer_ms = 0.0
 
-        if policy is not None or dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+            if policy is not None or dataset is not None:
+                observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
-        if policy is not None and preprocessor is not None and postprocessor is not None:
-            action_values = predict_action(
-                observation=observation_frame,
-                policy=policy,
-                device=get_safe_torch_device(policy.config.device),
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=policy.config.use_amp,
-                task=single_task,
-                robot_type=robot.robot_type,
-            )
-            act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
-            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
-            action_values = robot_action_to_send
-
-        elif policy is None and isinstance(teleop, Teleoperator):
-            act = teleop.get_action()
-            if robot.name == "unitree_g1":
-                teleop.send_feedback(obs)
-
-            act_processed_teleop = teleop_action_processor((act, obs))
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-
-        elif policy is None and isinstance(teleop, list):
-            arm_action = teleop_arm.get_action()
-            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
-            keyboard_action = teleop_keyboard.get_action()
-            base_action = robot._from_keyboard_to_base_action(keyboard_action)
-            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
-            act_processed_teleop = teleop_action_processor((act, obs))
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-        else:
-            no_action_count += 1
-            if no_action_count == 1 or no_action_count % 10 == 0:
-                logging.warning(
-                    "No policy or teleoperator provided, skipping action generation. "
-                    "This is likely to happen when resetting the environment without a teleop device. "
-                    "The robot won't be at its rest position at the start of the next episode."
+            if policy is not None and preprocessor is not None and postprocessor is not None:
+                infer_t0 = time.perf_counter()
+                action_values = predict_action(
+                    observation=observation_frame,
+                    policy=policy,
+                    device=get_safe_torch_device(policy.config.device),
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=policy.config.use_amp,
+                    task=single_task,
+                    robot_type=robot.robot_type,
                 )
-            continue
+                infer_ms = (time.perf_counter() - infer_t0) * 1000
+                act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+                robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+                action_values = robot_action_to_send
 
-        _sent_action = robot.send_action(robot_action_to_send)
+            elif policy is None and isinstance(teleop, Teleoperator):
+                act = teleop.get_action()
+                if robot.name == "unitree_g1":
+                    teleop.send_feedback(obs)
 
-        if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-            frame = {**observation_frame, **action_frame, "task": single_task}
-            dataset.add_frame(frame)
+                act_processed_teleop = teleop_action_processor((act, obs))
+                action_values = act_processed_teleop
+                robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
-        if display_data:
-            log_rerun_data(
-                observation=obs_processed, action=action_values, compress_images=display_compressed_images
+            elif policy is None and isinstance(teleop, list):
+                arm_action = teleop_arm.get_action()
+                arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+                keyboard_action = teleop_keyboard.get_action()
+                base_action = robot._from_keyboard_to_base_action(keyboard_action)
+                act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+                act_processed_teleop = teleop_action_processor((act, obs))
+                action_values = act_processed_teleop
+                robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+            else:
+                no_action_count += 1
+                if no_action_count == 1 or no_action_count % 10 == 0:
+                    logging.warning(
+                        "No policy or teleoperator provided, skipping action generation. "
+                        "This is likely to happen when resetting the environment without a teleop device. "
+                        "The robot won't be at its rest position at the start of the next episode."
+                    )
+                continue
+
+            debug_info = getattr(policy, "_last_action_debug", {}) if policy is not None else {}
+            should_write_action_state_debug = bool(
+                action_state_debug_fh is not None and debug_info.get("is_boundary")
             )
+            obs_state_vector = None
+            state_before_send_vector = None
+            state_before_send_ms = 0.0
+            if should_write_action_state_debug:
+                obs_state_vector = np.asarray(observation_frame[OBS_STATE], dtype=np.float32).reshape(-1).tolist()
+                state_t0 = time.perf_counter()
+                state_before_send_vector = vectorize_state(read_state_before_send())
+                state_before_send_ms = (time.perf_counter() - state_t0) * 1000
 
-        dt_s = time.perf_counter() - start_loop_t
-        sleep_time_s: float = 1 / fps - dt_s
-        if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
+            send_t0 = time.perf_counter()
+            _sent_action = robot.send_action(robot_action_to_send)
+            send_ms = (time.perf_counter() - send_t0) * 1000
 
-        precise_sleep(max(sleep_time_s, 0.0))
+            if should_write_action_state_debug:
+                raw_action0_vector = tensor_to_action_vector(debug_info.get("raw_action0"))
+                executed_action0_vector = tensor_to_action_vector(debug_info.get("executed_action0"))
+                previous_overlap_action0_vector = tensor_to_action_vector(debug_info.get("previous_overlap_action0"))
+                robot_action_to_send_vector = vectorize_action(robot_action_to_send)
+                sent_action_vector = vectorize_action(_sent_action) if isinstance(_sent_action, dict) else None
+                debug_row = {
+                    "episode_frame_index": int(debug_frame_index),
+                    "elapsed_s_before_sleep": float(time.perf_counter() - start_loop_t),
+                    "infer_ms": float(infer_ms),
+                    "obs_ms": float(obs_ms),
+                    "state_before_send_ms": float(state_before_send_ms),
+                    "send_ms": float(send_ms),
+                    "queue_len_before": debug_info.get("queue_len_before"),
+                    "overlap_len": debug_info.get("overlap_len"),
+                    "chunk_overlap_ensemble_prev_weight": debug_info.get("chunk_overlap_ensemble_prev_weight"),
+                    "chunk_boundary_bridge_steps": debug_info.get("chunk_boundary_bridge_steps"),
+                    "chunk_boundary_bridge_to_state": debug_info.get("chunk_boundary_bridge_to_state"),
+                    "action_names": list(action_feature_names),
+                    "obs_state": obs_state_vector,
+                    "state_before_send": state_before_send_vector,
+                    "raw_action0": raw_action0_vector,
+                    "executed_action0": executed_action0_vector,
+                    "previous_overlap_action0": previous_overlap_action0_vector,
+                    "robot_action_to_send": robot_action_to_send_vector,
+                    "sent_action": sent_action_vector,
+                    "obs_to_before_send": vector_distance(obs_state_vector, state_before_send_vector),
+                    "raw_action0_to_obs": vector_distance(raw_action0_vector, obs_state_vector),
+                    "executed_action0_to_obs": vector_distance(executed_action0_vector, obs_state_vector),
+                    "previous_overlap_action0_to_obs": vector_distance(
+                        previous_overlap_action0_vector, obs_state_vector
+                    ),
+                    "robot_action_to_send_to_obs": vector_distance(robot_action_to_send_vector, obs_state_vector),
+                    "sent_action_to_obs": vector_distance(sent_action_vector, obs_state_vector),
+                }
+                if include_action_chunks:
+                    raw_chunk = tensor_to_action_sequence(debug_info.get("raw_chunk"))
+                    executed_chunk = tensor_to_action_sequence(debug_info.get("executed_chunk"))
+                    previous_overlap_chunk = tensor_to_action_sequence(debug_info.get("previous_overlap_chunk"))
+                    debug_row.update(
+                        {
+                            "raw_chunk": raw_chunk,
+                            "executed_chunk": executed_chunk,
+                            "previous_overlap_chunk": previous_overlap_chunk,
+                            "raw_chunk_to_obs": vector_distances(raw_chunk, obs_state_vector),
+                            "executed_chunk_to_obs": vector_distances(executed_chunk, obs_state_vector),
+                            "previous_overlap_chunk_to_obs": vector_distances(
+                                previous_overlap_chunk, obs_state_vector
+                            ),
+                        }
+                    )
+                write_action_state_debug(debug_row)
 
-        timestamp = time.perf_counter() - start_episode_t
+            if dataset is not None:
+                action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+                frame = {**observation_frame, **action_frame, "task": single_task}
+                dataset.add_frame(frame)
+
+            if display_data:
+                log_rerun_data(
+                    observation=obs_processed, action=action_values, compress_images=display_compressed_images
+                )
+
+            dt_s = time.perf_counter() - start_loop_t
+            sleep_time_s: float = 1 / fps - dt_s
+            if sleep_time_s < 0:
+                logging.warning(
+                    f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                )
+
+            precise_sleep(max(sleep_time_s, 0.0))
+
+            debug_frame_index += 1
+            timestamp = time.perf_counter() - start_episode_t
+
+    finally:
+        if action_state_debug_fh is not None:
+            logging.info("[ActionStateDebug] Closed action_state_debug.jsonl")
+            action_state_debug_fh.close()
 
 
 @parser.wrap()
