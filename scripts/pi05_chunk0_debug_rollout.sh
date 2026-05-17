@@ -12,6 +12,7 @@ N_ACTION_STEPS=${N_ACTION_STEPS:-25}
 OVERLAP_PREV_WEIGHT=${OVERLAP_PREV_WEIGHT:-0.0}
 BRIDGE_STEPS=${BRIDGE_STEPS:-0}
 BRIDGE_TO_STATE=${BRIDGE_TO_STATE:-false}
+MAX_RELATIVE_TARGET=${MAX_RELATIVE_TARGET:-}
 TASK=${TASK:-Insert the copper screw into the black sleeve.}
 
 cd "$WORKTREE"
@@ -19,6 +20,14 @@ export PYTHONPATH="$WORKTREE/src:${PYTHONPATH:-}"
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export LEROBOT_ACTION_STATE_DEBUG_JSONL=${LEROBOT_ACTION_STATE_DEBUG_JSONL:-1}
 export LEROBOT_ACTION_STATE_DEBUG_INCLUDE_CHUNKS=${LEROBOT_ACTION_STATE_DEBUG_INCLUDE_CHUNKS:-0}
+
+MAX_RELATIVE_TARGET_ARGS=()
+if [[ -n "$MAX_RELATIVE_TARGET" && "$MAX_RELATIVE_TARGET" != "None" && "$MAX_RELATIVE_TARGET" != "none" ]]; then
+  MAX_RELATIVE_TARGET_ARGS=(
+    --robot.left_arm_config.max_relative_target="$MAX_RELATIVE_TARGET"
+    --robot.right_arm_config.max_relative_target="$MAX_RELATIVE_TARGET"
+  )
+fi
 
 set -x
 set +e
@@ -32,6 +41,7 @@ set +e
   --robot.right_arm_config.port=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B61033526-if00 \
   --robot.right_arm_config.use_degrees=true \
   '--robot.right_arm_config.cameras={"wrist": {"type": "opencv", "index_or_path": "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:9:1.0-video-index0", "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "front": {"type": "opencv", "index_or_path": "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:10:1.0-video-index0", "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}}' \
+  "${MAX_RELATIVE_TARGET_ARGS[@]}" \
   --policy.path="$POLICY_PATH" \
   --policy.n_action_steps="$N_ACTION_STEPS" \
   --policy.chunk_overlap_ensemble_prev_weight="$OVERLAP_PREV_WEIGHT" \
@@ -47,5 +57,5 @@ set +e
   --play_sounds=false 2>&1 | tee "$LOG"
 status=${PIPESTATUS[0]}
 set -e
-printf "\nRUN_ID=%s\nROOT=%s\nLOG=%s\nDEBUG_JSONL=%s\n" "$RUN_ID" "$ROOT" "$LOG" "$ROOT/action_state_debug.jsonl"
+printf "\nRUN_ID=%s\nROOT=%s\nLOG=%s\nDEBUG_JSONL=%s\nMAX_RELATIVE_TARGET=%s\n" "$RUN_ID" "$ROOT" "$LOG" "$ROOT/action_state_debug.jsonl" "${MAX_RELATIVE_TARGET:-none}"
 exit "$status"
