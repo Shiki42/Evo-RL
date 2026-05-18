@@ -39,6 +39,7 @@ class PI05Config(PreTrainedConfig):
     chunk_overlap_ensemble_prev_weight: float = 0.0
     chunk_boundary_bridge_steps: int = 0
     chunk_boundary_bridge_to_state: bool = False
+    chunk_boundary_bridge_anchor: str = "previous_action"
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -125,6 +126,9 @@ class PI05Config(PreTrainedConfig):
 
         if self.chunk_boundary_bridge_steps < 0:
             raise ValueError("chunk_boundary_bridge_steps must be non-negative")
+
+        if self.chunk_boundary_bridge_anchor not in {"previous_action", "state"}:
+            raise ValueError("chunk_boundary_bridge_anchor must be previous_action or state")
 
         if self.action_expert_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid action_expert_variant: {self.action_expert_variant}")

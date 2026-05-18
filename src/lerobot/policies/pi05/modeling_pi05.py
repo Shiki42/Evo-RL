@@ -1231,6 +1231,9 @@ class PI05Policy(PreTrainedPolicy):
         return blended_actions, prev_overlap, overlap_len
 
     def _bridge_anchor(self, batch: dict[str, Tensor], actions: Tensor) -> Tensor | None:
+        anchor_mode = getattr(self.config, "chunk_boundary_bridge_anchor", "previous_action")
+        if anchor_mode == "state" and self.config.chunk_boundary_bridge_to_state and OBS_STATE in batch:
+            return batch[OBS_STATE][:, : actions.shape[-1]]
         if self._last_selected_action is not None:
             return self._last_selected_action
         if not self.config.chunk_boundary_bridge_to_state or OBS_STATE not in batch:
@@ -1363,6 +1366,9 @@ class PI05Policy(PreTrainedPolicy):
                 "chunk_overlap_ensemble_prev_weight": self.config.chunk_overlap_ensemble_prev_weight,
                 "chunk_boundary_bridge_steps": self.config.chunk_boundary_bridge_steps,
                 "chunk_boundary_bridge_to_state": self.config.chunk_boundary_bridge_to_state,
+                "chunk_boundary_bridge_anchor": getattr(
+                    self.config, "chunk_boundary_bridge_anchor", "previous_action"
+                ),
                 "raw_action0": raw_actions[:, 0].detach(),
                 "executed_action0": actions_to_execute[:, 0].detach(),
                 "previous_overlap_action0": None if prev_overlap is None else prev_overlap[:, 0].detach(),

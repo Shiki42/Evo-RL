@@ -17,6 +17,7 @@ def _policy(**config_overrides) -> PI05Policy:
         chunk_overlap_ensemble_prev_weight=0.0,
         chunk_boundary_bridge_steps=0,
         chunk_boundary_bridge_to_state=False,
+        chunk_boundary_bridge_anchor="previous_action",
     )
     for name, value in config_overrides.items():
         setattr(config, name, value)
@@ -70,6 +71,7 @@ class _QueuePolicy(PI05Policy):
             "chunk_overlap_ensemble_prev_weight": 0.0,
             "chunk_boundary_bridge_steps": 0,
             "chunk_boundary_bridge_to_state": False,
+            "chunk_boundary_bridge_anchor": "previous_action",
             "output_features": {"action": SimpleNamespace(shape=(1,))},
         }
         if config_overrides:
@@ -121,4 +123,20 @@ def test_bridge_prefers_previous_action_for_later_chunks() -> None:
     bridged = policy._apply_chunk_boundary_bridge(batch, actions)
 
     torch.testing.assert_close(bridged[:, :2], torch.tensor([[[3.0], [6.0]]]))
+    torch.testing.assert_close(bridged[:, 2:], actions[:, 2:])
+
+
+def test_bridge_can_prefer_state_for_later_chunks() -> None:
+    policy = _policy(
+        chunk_boundary_bridge_steps=2,
+        chunk_boundary_bridge_to_state=True,
+        chunk_boundary_bridge_anchor="state",
+    )
+    policy._last_selected_action = torch.tensor([[0.0]])
+    actions = torch.tensor([[[9.0], [9.0], [9.0], [9.0]]])
+    batch = {OBS_STATE: torch.tensor([[3.0]])}
+
+    bridged = policy._apply_chunk_boundary_bridge(batch, actions)
+
+    torch.testing.assert_close(bridged[:, :2], torch.tensor([[[5.0], [7.0]]]))
     torch.testing.assert_close(bridged[:, 2:], actions[:, 2:])

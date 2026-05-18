@@ -12,7 +12,9 @@ N_ACTION_STEPS=${N_ACTION_STEPS:-25}
 OVERLAP_PREV_WEIGHT=${OVERLAP_PREV_WEIGHT:-0.0}
 BRIDGE_STEPS=${BRIDGE_STEPS:-0}
 BRIDGE_TO_STATE=${BRIDGE_TO_STATE:-false}
+BRIDGE_ANCHOR=${BRIDGE_ANCHOR:-previous_action}
 MAX_RELATIVE_TARGET=${MAX_RELATIVE_TARGET:-}
+SYNC_POLICY_LAST_ACTION_FROM_SENT=${SYNC_POLICY_LAST_ACTION_FROM_SENT:-0}
 TASK=${TASK:-Insert the copper screw into the black sleeve.}
 
 cd "$WORKTREE"
@@ -20,6 +22,7 @@ export PYTHONPATH="$WORKTREE/src:${PYTHONPATH:-}"
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export LEROBOT_ACTION_STATE_DEBUG_JSONL=${LEROBOT_ACTION_STATE_DEBUG_JSONL:-1}
 export LEROBOT_ACTION_STATE_DEBUG_INCLUDE_CHUNKS=${LEROBOT_ACTION_STATE_DEBUG_INCLUDE_CHUNKS:-0}
+export LEROBOT_SYNC_POLICY_LAST_ACTION_FROM_SENT="$SYNC_POLICY_LAST_ACTION_FROM_SENT"
 
 MAX_RELATIVE_TARGET_ARGS=()
 if [[ -n "$MAX_RELATIVE_TARGET" && "$MAX_RELATIVE_TARGET" != "None" && "$MAX_RELATIVE_TARGET" != "none" ]]; then
@@ -47,6 +50,7 @@ set +e
   --policy.chunk_overlap_ensemble_prev_weight="$OVERLAP_PREV_WEIGHT" \
   --policy.chunk_boundary_bridge_steps="$BRIDGE_STEPS" \
   --policy.chunk_boundary_bridge_to_state="$BRIDGE_TO_STATE" \
+  --policy.chunk_boundary_bridge_anchor="$BRIDGE_ANCHOR" \
   --dataset.repo_id="local/$RUN_ID" \
   --dataset.root="$ROOT" \
   --dataset.single_task="$TASK" \
@@ -57,5 +61,5 @@ set +e
   --play_sounds=false 2>&1 | tee "$LOG"
 status=${PIPESTATUS[0]}
 set -e
-printf "\nRUN_ID=%s\nROOT=%s\nLOG=%s\nDEBUG_JSONL=%s\nMAX_RELATIVE_TARGET=%s\n" "$RUN_ID" "$ROOT" "$LOG" "$ROOT/action_state_debug.jsonl" "${MAX_RELATIVE_TARGET:-none}"
+printf "\nRUN_ID=%s\nROOT=%s\nLOG=%s\nDEBUG_JSONL=%s\nBRIDGE_ANCHOR=%s\nMAX_RELATIVE_TARGET=%s\nSYNC_POLICY_LAST_ACTION_FROM_SENT=%s\n" "$RUN_ID" "$ROOT" "$LOG" "$ROOT/action_state_debug.jsonl" "$BRIDGE_ANCHOR" "${MAX_RELATIVE_TARGET:-none}" "$SYNC_POLICY_LAST_ACTION_FROM_SENT"
 exit "$status"

@@ -72,6 +72,7 @@ from pprint import pformat
 from typing import Any
 
 import numpy as np
+import torch
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
@@ -365,6 +366,25 @@ def record_loop(
             value = value.unsqueeze(1)
         return [tensor_to_action_vector(value[:, step]) for step in range(value.shape[1])]
 
+    def normalize_policy_action(action: torch.Tensor) -> torch.Tensor:
+        action = action.unsqueeze(0) if action.dim() == 1 else action
+        for step in preprocessor.steps:
+            if step.__class__.__name__ == "NormalizerProcessorStep":
+                return step._normalize_action(action, inverse=False)
+        raise ValueError("Policy preprocessor has no NormalizerProcessorStep")
+
+    def sync_last_policy_action_from_sent(sent_action_vector: list[float] | None) -> bool:
+        if not sync_policy_last_action_from_sent or policy is None or preprocessor is None:
+            return False
+        if sent_action_vector is None:
+            return False
+        sent_action = torch.tensor(sent_action_vector, dtype=torch.float32)
+        policy_action = normalize_policy_action(sent_action)
+        if hasattr(policy, "parameters"):
+            policy_action = policy_action.to(next(policy.parameters()).device)
+        policy._last_selected_action = policy_action.detach().clone()
+        return True
+
     def vector_distances(
         sequence: list[list[float]] | None, right: list[float] | None
     ) -> list[dict[str, float]] | None:
@@ -388,6 +408,9 @@ def record_loop(
         "true",
         "yes",
     }
+    sync_policy_last_action_from_sent = os.environ.get(
+        "LEROBOT_SYNC_POLICY_LAST_ACTION_FROM_SENT", ""
+    ).lower() in {"1", "true", "yes"}
     if action_state_debug_path and dataset is not None and hasattr(dataset, "root"):
         if action_state_debug_path.lower() in {"1", "true", "yes"}:
             debug_path = dataset.root / "action_state_debug.jsonl"
@@ -485,13 +508,17 @@ def record_loop(
             send_t0 = time.perf_counter()
             _sent_action = robot.send_action(robot_action_to_send)
             send_ms = (time.perf_counter() - send_t0) * 1000
+            sent_action_vector_for_policy = (
+                vectorize_action(_sent_action) if isinstance(_sent_action, dict) else None
+            )
+            policy_last_action_synced = sync_last_policy_action_from_sent(sent_action_vector_for_policy)
 
             if should_write_action_state_debug:
                 raw_action0_vector = tensor_to_action_vector(debug_info.get("raw_action0"))
                 executed_action0_vector = tensor_to_action_vector(debug_info.get("executed_action0"))
                 previous_overlap_action0_vector = tensor_to_action_vector(debug_info.get("previous_overlap_action0"))
                 robot_action_to_send_vector = vectorize_action(robot_action_to_send)
-                sent_action_vector = vectorize_action(_sent_action) if isinstance(_sent_action, dict) else None
+                sent_action_vector = sent_action_vector_for_policy
                 debug_row = {
                     "episode_frame_index": int(debug_frame_index),
                     "elapsed_s_before_sleep": float(time.perf_counter() - start_loop_t),
@@ -504,6 +531,8 @@ def record_loop(
                     "chunk_overlap_ensemble_prev_weight": debug_info.get("chunk_overlap_ensemble_prev_weight"),
                     "chunk_boundary_bridge_steps": debug_info.get("chunk_boundary_bridge_steps"),
                     "chunk_boundary_bridge_to_state": debug_info.get("chunk_boundary_bridge_to_state"),
+                    "chunk_boundary_bridge_anchor": debug_info.get("chunk_boundary_bridge_anchor"),
+                    "policy_last_action_synced_from_sent": policy_last_action_synced,
                     "action_names": list(action_feature_names),
                     "obs_state": obs_state_vector,
                     "state_before_send": state_before_send_vector,
