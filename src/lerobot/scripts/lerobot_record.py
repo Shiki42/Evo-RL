@@ -411,6 +411,9 @@ def record_loop(
     sync_policy_last_action_from_sent = os.environ.get(
         "LEROBOT_SYNC_POLICY_LAST_ACTION_FROM_SENT", ""
     ).lower() in {"1", "true", "yes"}
+    record_sent_action_as_dataset_action = os.environ.get(
+        "LEROBOT_RECORD_SENT_ACTION_AS_DATASET_ACTION", ""
+    ).lower() in {"1", "true", "yes"}
     if action_state_debug_path and dataset is not None and hasattr(dataset, "root"):
         if action_state_debug_path.lower() in {"1", "true", "yes"}:
             debug_path = dataset.root / "action_state_debug.jsonl"
@@ -533,6 +536,7 @@ def record_loop(
                     "chunk_boundary_bridge_to_state": debug_info.get("chunk_boundary_bridge_to_state"),
                     "chunk_boundary_bridge_anchor": debug_info.get("chunk_boundary_bridge_anchor"),
                     "policy_last_action_synced_from_sent": policy_last_action_synced,
+                    "record_sent_action_as_dataset_action": record_sent_action_as_dataset_action,
                     "action_names": list(action_feature_names),
                     "obs_state": obs_state_vector,
                     "state_before_send": state_before_send_vector,
@@ -569,7 +573,10 @@ def record_loop(
                 write_action_state_debug(debug_row)
 
             if dataset is not None:
-                action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+                dataset_action_values = action_values
+                if record_sent_action_as_dataset_action and isinstance(_sent_action, dict):
+                    dataset_action_values = _sent_action
+                action_frame = build_dataset_frame(dataset.features, dataset_action_values, prefix=ACTION)
                 frame = {**observation_frame, **action_frame, "task": single_task}
                 dataset.add_frame(frame)
 
