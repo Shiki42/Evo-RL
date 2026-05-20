@@ -32,7 +32,7 @@ def load_sft_pi05_processors(
             "QUANTILES stats — deploy parity depends on it."
         )
 
-    overrides = {"tokenizer_processor": {"tokenizer_name": "google/paligemma-3b-pt-224"}}
+    overrides = {"tokenizer_processor": {"tokenizer_name": "leo009/paligemma-3b-pt-224"}}
     pre = PolicyProcessorPipeline.from_pretrained(
         pretrained_model_name_or_path=vla_pretrained_path,
         config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",

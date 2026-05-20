@@ -179,6 +179,7 @@ def main() -> None:
         repo_id=args.demo_dataset_repo_id,
         root=args.demo_dataset_root,
         delta_timestamps=delta,
+        video_backend="pyav",  # torchcodec broken on coder b nightly; matches SFT training config
     )
     n_episodes = dataset.num_episodes
     if args.max_episodes is not None:
