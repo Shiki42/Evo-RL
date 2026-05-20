@@ -28,7 +28,7 @@ from torch.optim import Optimizer
 from lerobot.configs import parser
 from lerobot.configs.train import RLTokenJointConfig, TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.sampler import EpisodeAwareSampler, build_weighted_dataset_sampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
@@ -535,6 +535,11 @@ def train(
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
+    if hasattr(cfg.policy, "drop_n_last_frames") and cfg.dataset.sampling_weights is not None:
+        raise ValueError(
+            "dataset.sampling_weights and EpisodeAwareSampler (triggered by "
+            "policy.drop_n_last_frames) are mutually exclusive: pick one."
+        )
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
@@ -543,6 +548,18 @@ def train(
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
             shuffle=True,
+        )
+    elif cfg.dataset.sampling_weights is not None:
+        shuffle = False
+        if cfg.dataset.sampling_group_frames is None:
+            raise ValueError("dataset.sampling_weights requires dataset.sampling_group_frames")
+        if sum(cfg.dataset.sampling_group_frames) != len(dataset):
+            raise ValueError(
+                f"sampling_group_frames sum ({sum(cfg.dataset.sampling_group_frames)}) "
+                f"must equal dataset length ({len(dataset)})"
+            )
+        sampler = build_weighted_dataset_sampler(
+            cfg.dataset.sampling_group_frames, cfg.dataset.sampling_weights
         )
     else:
         shuffle = True
