@@ -146,10 +146,12 @@ class RLTokenPolicy(PreTrainedPolicy):
 
     def get_optim_params(self) -> list:
         groups = [
-            {"params": list(self.rl_token.parameters())},
+            {"params": list(self.rl_token.parameters()), "lr": self.config.rl_token_lr},
         ]
         if self.config.vla_ft_weight > 0:
-            groups.append({"params": [p for p in self._pi05.parameters() if p.requires_grad]})
+            vla_params = [p for p in self._pi05.parameters() if p.requires_grad]
+            if vla_params:
+                groups.append({"params": vla_params, "lr": self.config.vla_lr})
         return groups
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
@@ -176,10 +178,18 @@ class RLTokenPolicy(PreTrainedPolicy):
             gamma=self.config.norm_gamma,
         )
         total = self.config.recon_weight * loss_recon + self.config.vla_ft_weight * loss_vla
+        self._fwd_count = getattr(self, "_fwd_count", 0) + 1
+        if self._fwd_count % 50 == 0:
+            log.info(
+                "rlt fwd~%d loss_recon=%.6f loss_vla=%.6f",
+                self._fwd_count,
+                loss_recon.detach().item(),
+                loss_vla.detach().item(),
+            )
         return total, {
-            "loss": total.detach(),
-            "loss_recon": loss_recon.detach(),
-            "loss_vla": loss_vla.detach(),
+            "loss": total.detach().item(),
+            "loss_recon": loss_recon.detach().item(),
+            "loss_vla": loss_vla.detach().item(),
         }
 
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:

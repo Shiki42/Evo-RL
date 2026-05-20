@@ -34,7 +34,7 @@ def make_optimizer_and_scheduler(
     Returns:
         tuple[Optimizer, LRScheduler | None]: The couple (Optimizer, Scheduler). Scheduler can be `None`.
     """
-    params = policy.get_optim_params() if cfg.use_policy_training_preset else policy.parameters()
+    params = policy.get_optim_params()  # always: param-set is policy-decided, orthogonal to hyperparam preset
     if cfg.optimizer is None:
         raise ValueError("Optimizer config is required but not provided in TrainPipelineConfig")
     optimizer = cfg.optimizer.build(params)

@@ -48,6 +48,13 @@ class RLTokenPolicyConfig(PreTrainedConfig):
     norm_gamma: float = 0.0
     norm_stats_path: str | None = None
 
+    # --- Per-group learning rates (joint training; used when vla_ft_weight>0) ---
+    # These override --optimizer.lr / --scheduler.peak_lr for their respective
+    # param group. The cosine scheduler still scales both groups by the same
+    # LambdaLR factor, so the RL-token : VLA ratio is preserved end-to-end.
+    rl_token_lr: float = 2e-4
+    vla_lr: float = 2e-5
+
     # --- Dimensions ---
     chunk_size: int = 50
     action_dim: int = 12
