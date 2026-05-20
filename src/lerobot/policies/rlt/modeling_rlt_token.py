@@ -49,6 +49,35 @@ def _load_pi05_config_from_dir(pretrained_path: str) -> PI05Config:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+def _validate_vla_path(vla_pretrained_path: str) -> Path:
+    """Pre-flight: raise loudly if the VLA ckpt dir is missing or has no weights.
+
+    Guards against baked vla_pretrained_path values drifting across machines.
+    Without this, PI05Policy.from_pretrained(strict=False) would silently
+    produce a randomly-initialized backbone — catastrophic and almost invisible
+    in logs (PI05Policy.from_pretrained prints "Missing keys: ..." but never
+    raises).
+    """
+    vla_dir = Path(vla_pretrained_path)
+    if not vla_dir.is_dir():
+        raise FileNotFoundError(
+            f"vla_pretrained_path does not exist: {vla_dir}. "
+            "If this path was baked into the policy config from another machine, "
+            "set cfg.vla_pretrained_path to a local path before constructing the policy."
+        )
+    weight_files = (
+        list(vla_dir.glob("model*.safetensors"))
+        + list(vla_dir.glob("pytorch_model*.bin"))
+    )
+    if not weight_files:
+        raise FileNotFoundError(
+            f"No model weights (model*.safetensors / pytorch_model*.bin) found in {vla_dir}. "
+            "PI05Policy.from_pretrained with strict=False would silently random-init "
+            "the backbone instead of raising."
+        )
+    return vla_dir
+
+
 def _load_norm_stats(path: str | None) -> Tensor | None:
     """Load per-dim std for weighted reconstruction loss.
 
@@ -122,6 +151,7 @@ class RLTokenPolicy(PreTrainedPolicy):
     # ------------------------------------------------------------------
 
     def _load_pi05_backbone(self) -> PI05Policy:
+        _validate_vla_path(self.config.vla_pretrained_path)
         pi05_cfg = _load_pi05_config_from_dir(self.config.vla_pretrained_path)
         pi05_cfg.dtype = self.config.vla_dtype
         pi05_cfg.device = self.config.device
