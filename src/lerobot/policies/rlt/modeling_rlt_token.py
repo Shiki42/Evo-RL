@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
+import packaging
+import safetensors
 import torch
+from safetensors.torch import load_model as load_model_as_safetensor, save_model as save_model_as_safetensor
 from torch import Tensor
 from typing_extensions import Unpack
 
@@ -14,10 +18,13 @@ from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.policies.pretrained import ActionSelectKwargs, PreTrainedPolicy
 from lerobot.policies.rlt.configuration_rlt_token import RLTokenPolicyConfig
+from lerobot.policies.utils import log_model_loading_keys
 from lerobot.rlt.rl_token import RLTokenModule
 from lerobot.rlt.utils import postprocess_prefix_tokens
 
 log = logging.getLogger(__name__)
+
+VLA_SAFETENSORS_FILE = "vla.safetensors"
 
 
 def _load_pi05_config_from_dir(pretrained_path: str) -> PI05Config:
@@ -136,6 +143,51 @@ class RLTokenPolicy(PreTrainedPolicy):
         tokens_per_camera = (self.config.image_resolution[0] // vision_cfg.patch_size) ** 2
         num_cameras = len(self.config.camera_keys)
         return tokens_per_camera * num_cameras
+
+    # ------------------------------------------------------------------
+    # Persistence (cotrained pi0.5 lives outside nn.Module._modules)
+    # ------------------------------------------------------------------
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        """Save RLT state via super, and also dump pi0.5 when it was fine-tuned.
+
+        Because `_pi05` is stashed via `object.__setattr__`, it is invisible to
+        `state_dict()` and therefore to the standard safetensors save path. When
+        `vla_ft_weight > 0` the backbone is being updated and must be persisted
+        alongside the RLT weights; otherwise the cotrained gains are silently
+        dropped on the next reload.
+        """
+        super()._save_pretrained(save_directory)
+        if self.config.vla_ft_weight > 0:
+            vla_path = save_directory / VLA_SAFETENSORS_FILE
+            save_model_as_safetensor(self._pi05, str(vla_path))
+            n_params = sum(p.numel() for p in self._pi05.parameters())
+            log.info("saved cotrained VLA to %s (%d params)", vla_path, n_params)
+
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file: str, map_location: str, strict: bool):
+        """Load RLT state via super, and also pi0.5 if a `vla.safetensors` sits beside it.
+
+        Old checkpoints (frozen-VLA runs or pre-patch saves) have no auxiliary
+        file; in that case the fresh pi0.5 loaded by ``__init__`` is kept as-is.
+        We deliberately avoid try/except here — file existence is the contract.
+
+        ``strict=False`` mirrors `_load_pi05_backbone`'s SFT-baseline load
+        (PI05Policy ships a weight-key remap path that explicitly requires
+        non-strict). Any missing/unexpected keys are still surfaced via
+        ``log_model_loading_keys`` — same diagnostic channel the base
+        ``_load_as_safetensor`` uses for the RLT half.
+        """
+        model = super()._load_as_safetensor(model, model_file, map_location, strict)
+        vla_path = os.path.join(os.path.dirname(model_file), VLA_SAFETENSORS_FILE)
+        if os.path.exists(vla_path):
+            load_kwargs: dict[str, Any] = {"strict": False}
+            if packaging.version.parse(safetensors.__version__) >= packaging.version.parse("0.4.3"):
+                load_kwargs["device"] = map_location
+            missing_keys, unexpected_keys = load_model_as_safetensor(model._pi05, vla_path, **load_kwargs)
+            log_model_loading_keys(missing_keys, unexpected_keys)
+            log.info("loaded cotrained VLA from %s", vla_path)
+        return model
 
     # ------------------------------------------------------------------
     # PreTrainedPolicy abstract methods
