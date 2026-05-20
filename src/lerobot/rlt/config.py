@@ -61,6 +61,9 @@ class TrainingConfig:
     batch_size: int = 256
     utd_ratio: int = 5
     actor_update_interval: int = 2
+    # AC4: TD3 target-policy smoothing (paper-default values)
+    target_policy_noise: float = 0.2
+    target_noise_clip: float = 0.5
 
 
 @dataclass

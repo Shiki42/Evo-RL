@@ -42,6 +42,11 @@ class RLTAlgorithm:
         for p in self.target_critic.parameters():
             p.requires_grad = False
 
+        # AC3: target actor (Polyak chain) for stable Bellman bootstrap targets
+        self.target_actor = copy.deepcopy(policy.actor)
+        for p in self.target_actor.parameters():
+            p.requires_grad = False
+
     # ------------------------------------------------------------------
     # Training update helpers
     # ------------------------------------------------------------------
@@ -55,7 +60,7 @@ class RLTAlgorithm:
         grad_clip: float = 1.0,
     ) -> float:
         """Single critic gradient step with gradient clipping."""
-        loss = critic_loss(self.critic, self.target_critic, self.policy.actor, batch, gamma, C)
+        loss = critic_loss(self.critic, self.target_critic, self.target_actor, batch, gamma, C, target_policy_noise=getattr(self.config.training, "target_policy_noise", 0.2), target_noise_clip=getattr(self.config.training, "target_noise_clip", 0.5))
         critic_optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
@@ -80,8 +85,9 @@ class RLTAlgorithm:
         return loss.item()
 
     def soft_update_target(self, tau: float) -> None:
-        """Polyak-average online critic into target critic."""
+        """Polyak-average online critic+actor into their target copies."""
         soft_update(self.target_critic, self.critic, tau)
+        soft_update(self.target_actor, self.policy.actor, tau)
 
     # ------------------------------------------------------------------
     # RL Token full model helpers (for demo adaptation)

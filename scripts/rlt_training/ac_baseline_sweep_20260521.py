@@ -180,7 +180,7 @@ def run_experiment(exp: ExperimentConfig, cache_dir: str, device: str, results_f
     for step in range(1, exp.gradient_steps + 1):
         batch = {k: v.to(device) for k, v in train_buffer.sample(exp.batch_size).items()}
 
-        c_loss = critic_loss(algorithm.critic, algorithm.target_critic, algorithm.policy.actor, batch, gamma, C)
+        c_loss = critic_loss(algorithm.critic, algorithm.target_critic, algorithm.target_actor, batch, gamma, C, target_policy_noise=config.training.target_policy_noise, target_noise_clip=config.training.target_noise_clip)
         critic_opt.zero_grad()
         c_loss.backward()
         torch.nn.utils.clip_grad_norm_(algorithm.critic.parameters(), 1.0)
@@ -196,7 +196,7 @@ def run_experiment(exp: ExperimentConfig, cache_dir: str, device: str, results_f
             actor_opt.step()
             actor_losses.append(a_loss.item())
 
-        soft_update(algorithm.target_critic, algorithm.critic, tau)
+        algorithm.soft_update_target(tau)
 
         if step % 10_000 == 0:
             avg_a = sum(actor_losses[-5000:]) / max(len(actor_losses[-5000:]), 1)
