@@ -234,7 +234,7 @@ def main():
         )
         print()
 
-        from lerobot.scripts.lerobot_record import record
+        from lerobot.scripts.lerobot_rlt_record import record
         record()
 
     if leader_cal_dir is not None:
