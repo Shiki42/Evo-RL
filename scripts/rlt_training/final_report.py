@@ -25,7 +25,12 @@ SOURCES = [
 
 
 def composite_score(r: dict) -> float:
-    return r["ref_mse"] * 100.0 - r.get("q_gap", 0.0) * 1.0
+    # Reject diverged runs: legit ref_mse < 1.0 and |q_gap| < 10.0
+    ref_mse = r["ref_mse"]
+    q_gap = r.get("q_gap", 0.0)
+    if ref_mse > 1.0 or abs(q_gap) > 10.0 or ref_mse != ref_mse:
+        return float("inf")
+    return ref_mse * 100.0 - q_gap * 1.0
 
 
 def main():
