@@ -121,6 +121,7 @@ class RLTActionModifier(nn.Module):
         action_dim: int,
         proprio_dim: int,
         chunk_exec_steps: int = 25,
+        vla_ref: bool = True,
     ):
         super().__init__()
         self.rl_token = rl_token
@@ -128,6 +129,7 @@ class RLTActionModifier(nn.Module):
         self.phase_ctrl = phase_ctrl
         self.chunk_length = chunk_length
         self.chunk_exec_steps = chunk_exec_steps
+        self.vla_ref = vla_ref
         self.action_dim = action_dim
         self.proprio_dim = proprio_dim
         self._action_queue: deque[Tensor] = deque()
@@ -181,6 +183,11 @@ class RLTActionModifier(nn.Module):
         z_rl = self.rl_token.encode(prefix_tokens)
         state_vec = torch.cat([z_rl, proprio], dim=-1)
         ref_flat = flatten_chunk(ref_chunk)
+        if not self.vla_ref:
+            # Hide the VLA reference from the actor: training ref-dropout
+            # multiplies ref_chunk_flat by a 0/1 mask, so a dropped sample
+            # is exactly an all-zero ref. Reproduce that here.
+            ref_flat = torch.zeros_like(ref_flat)
         mu, _ = self.actor(state_vec, ref_flat, training=False)
         chunk = unflatten_chunk(mu, self.chunk_length).clamp(-1, 1)
 

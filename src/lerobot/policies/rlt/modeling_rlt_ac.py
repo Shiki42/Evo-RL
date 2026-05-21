@@ -90,6 +90,9 @@ class ChunkACPolicy(PreTrainedPolicy):
 
         # Deploy-only: lazy build at .reset() time.
         self.modifier: RLTActionModifier | None = None
+        # Deploy toggle (set by lerobot_rlt_record). False => the actor sees a
+        # zeroed VLA reference chunk in RL phase (mirrors training ref-dropout).
+        self.vla_ref: bool = True
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -202,6 +205,7 @@ class ChunkACPolicy(PreTrainedPolicy):
                 action_dim=self.config.action_dim,
                 proprio_dim=self.config.proprio_dim,
                 chunk_exec_steps=self.config.chunk_exec_steps,
+                vla_ref=self.vla_ref,
             )
             self._prefix_capture = PrefixOutputCapture(
                 token_pool_size=self.config.token_pool_size,

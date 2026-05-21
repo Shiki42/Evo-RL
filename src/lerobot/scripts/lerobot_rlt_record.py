@@ -306,6 +306,10 @@ class RecordConfig:
     # Path to a JSON file with robot + camera config (e.g. roboclaw setup.json).
     # When set, overrides robot port and camera CLI args.
     robot_config_file: str | None = None
+    # If False, the rlt_ac actor receives a zeroed VLA reference chunk at
+    # inference (mirrors training ref-dropout). RL phase only; VLA passthrough
+    # and non-rlt_ac policies are unaffected.
+    vla_ref: bool = True
 
     def __post_init__(self):
         if self.robot_config_file is not None:
@@ -561,6 +565,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         # Load pretrained policy
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+        from lerobot.policies.rlt.modeling_rlt_ac import ChunkACPolicy
+        if isinstance(policy, ChunkACPolicy):
+            policy.vla_ref = cfg.vla_ref
+            logging.info("rlt_ac vla_ref=%s (False => zeroed VLA reference chunk)", cfg.vla_ref)
         preprocessor = None
         postprocessor = None
         if cfg.acp_inference.enable and cfg.policy is None:
