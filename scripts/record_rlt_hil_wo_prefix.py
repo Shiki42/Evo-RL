@@ -77,6 +77,9 @@ def parse_args() -> argparse.Namespace:
                    help="Skip leader arm teleop (disables human intervention).")
     p.add_argument("--double-tap-window-s", type=float, default=0.6,
                    help="Window for second 'r' press to mark failure instead of success.")
+    p.add_argument("--vla-ref", action=argparse.BooleanOptionalAction, default=True,
+                   help="Whether the AC actor sees the VLA reference chunk. Pass "
+                        "--no-vla-ref to feed a zeroed reference (mirrors training ref-dropout).")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()
 
@@ -220,6 +223,7 @@ def main():
             "--enable_episode_outcome_labeling=true",
             "--intervention_state_machine_enabled=true",
             f"--policy_sync_to_teleop={'true' if teleop_argv else 'false'}",
+            f"--vla_ref={'true' if args.vla_ref else 'false'}",
             "--play_sounds=true",
         ]
 
@@ -227,6 +231,7 @@ def main():
         print(f"\nDataset: {dataset_name} -> {dataset_root}")
         print(f"Log: {log_file}")
         print(f"Policy: {args.policy_path}")
+        print(f"VLA reference to AC actor: {'ON' if args.vla_ref else 'OFF (zeroed)'}")
         print(
             "RLT HIL wo-prefix mode (pure RL): teleop→r=start RL episode; "
             "in RL: r=end success, r+r within "
