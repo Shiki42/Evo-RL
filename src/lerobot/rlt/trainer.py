@@ -344,7 +344,7 @@ def offline_rl_loop(
                 a_loss = algorithm.actor_update(batch, actor_optimizer, beta)
                 metrics.actor_losses.append(a_loss)
 
-        algorithm.soft_update_target(tau)
+            algorithm.soft_update_target(tau)
 
         if step % off_cfg.log_every == 0:
             a_str = f"{a_loss:.4f}" if a_loss is not None else "N/A"

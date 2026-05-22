@@ -381,6 +381,11 @@ class PaliGemmaWithExpertModel(
         )
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
+        # Tie lm_head <-> language_model.embed_tokens to share a single nn.Parameter.
+        # Upstream HF PaliGemma does NOT tie them by default; pi0.5 SFT ckpts store
+        # only lm_head.weight. Without this rebind, load_state_dict either leaves
+        # embed_tokens.weight at random init or counts the embedding twice (OOM risk).
+        self.paligemma.lm_head.weight = self.paligemma.model.language_model.embed_tokens.weight
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
@@ -1110,6 +1115,17 @@ class PI05Policy(PreTrainedPolicy):
 
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
+
+        # Param-count assertion: pi0.5 (PaliGemma 2B + Gemma 300M, bf16) with embed_tokens
+        # tied to lm_head. Diverging from 3,616,757,520 means the tie regressed.
+        expected_params = 3_616_757_520
+        actual_params = sum(p.numel() for p in model.parameters())
+        if actual_params != expected_params:
+            raise RuntimeError(
+                f"PI05 param count mismatch: expected {expected_params:,}, got {actual_params:,}. "
+                "Likely cause: lm_head/embed_tokens not tied. Verify "
+                "PaliGemmaWithExpertModel.__init__ has `self.paligemma.lm_head.weight = embed.weight`."
+            )
 
         return model
 

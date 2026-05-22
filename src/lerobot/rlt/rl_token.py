@@ -24,6 +24,7 @@ class RLTokenModule(nn.Module):
         ff_dim: int | None = None,
         num_rl_tokens: int = 1,
         inference_only: bool = False,
+        init_scale: float = 0.02,
     ):
         super().__init__()
         if ff_dim is None:
@@ -32,7 +33,7 @@ class RLTokenModule(nn.Module):
         self.token_dim = token_dim
         self.num_rl_tokens = num_rl_tokens
         self.inference_only = inference_only
-        self.rl_token_embed = nn.Parameter(torch.randn(1, num_rl_tokens, token_dim) * 0.02)
+        self.rl_token_embed = nn.Parameter(torch.randn(1, num_rl_tokens, token_dim) * init_scale)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=token_dim,

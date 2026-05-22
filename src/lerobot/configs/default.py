@@ -30,18 +30,26 @@ class DatasetConfig:
     # Root directory where the dataset will be stored (e.g. 'dataset/path').
     root: str | None = None
     episodes: list[int] | None = None
+    # Weighted sampling over a merged dataset of concatenated source groups.
+    # sampling_group_frames: frame count of each source group (concatenation order).
+    # sampling_weights: target proportion per group, e.g. [0.5, 0.5] for a 1:1 mix.
+    sampling_group_frames: list[int] | None = None
+    sampling_weights: list[float] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+    # Dataset class dispatched by make_dataset. "lerobot" -> LeRobotDataset,
+    # "rlt_chunk_transition" -> ChunkTransitionDataset (precomputed chunk cache).
+    type: str = "lerobot"
 
 
 @dataclass
 class WandBConfig:
     enable: bool = False
-    # Set to true to disable saving an artifact despite training.save_checkpoint=True
-    disable_artifact: bool = False
+    # Default True: skip uploading checkpoints as wandb artifacts (they bloat wandb storage; checkpoints kept locally).
+    disable_artifact: bool = True
     project: str = "lerobot"
     entity: str | None = None
     notes: str | None = None
