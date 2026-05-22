@@ -63,6 +63,7 @@ class ActionQueue:
         self.lock = Lock()
         self.last_index = 0
         self.cfg = cfg
+        self._executed_since_merge = 0  # actions popped since the last merge()
 
     def get(self) -> Tensor | None:
         """Get the next action from the queue.
@@ -77,6 +78,7 @@ class ActionQueue:
 
             action = self.queue[self.last_index]
             self.last_index += 1
+            self._executed_since_merge += 1
             return action.clone()
 
     def qsize(self) -> int:
@@ -145,13 +147,21 @@ class ActionQueue:
             action_index_before_inference: Index before inference started, for validation.
         """
         with self.lock:
+            executed = self._executed_since_merge
+            self._executed_since_merge = 0
             self._check_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:
                 self._replace_actions_queue(original_actions, processed_actions, real_delay)
-                return
+            else:
+                self._append_actions_queue(original_actions, processed_actions)
 
-            self._append_actions_queue(original_actions, processed_actions)
+            queue_len = 0 if self.queue is None else len(self.queue)
+            logger.info(
+                "[RTC] previous chunk executed %d steps before refill; "
+                "real_delay=%d; new queue length=%d",
+                executed, real_delay, queue_len,
+            )
 
     def _replace_actions_queue(self, original_actions: Tensor, processed_actions: Tensor, real_delay: int):
         """Replace the queue with new actions (RTC mode).

@@ -312,6 +312,11 @@ def get_actions(
                 new_latency = time.perf_counter() - current_time
                 new_delay = math.ceil(new_latency / time_per_chunk)
                 latency_tracker.add(new_latency)
+                logger.info(
+                    "[RTC] inference latency=%.1fms (delay=%d steps) | "
+                    "inference_delay used=%d | queue before merge=%d",
+                    new_latency * 1000.0, new_delay, inference_delay, action_queue.qsize(),
+                )
 
                 if cfg.action_queue_size_to_get_new_actions < cfg.rtc.execution_horizon + new_delay:
                     logger.warning(

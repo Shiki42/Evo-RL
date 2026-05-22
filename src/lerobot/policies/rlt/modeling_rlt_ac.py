@@ -90,6 +90,9 @@ class ChunkACPolicy(PreTrainedPolicy):
 
         # Deploy-only: lazy build at .reset() time.
         self.modifier: RLTActionModifier | None = None
+        # Deploy toggle (set by lerobot_rlt_record). False => the actor sees a
+        # zeroed VLA reference chunk in RL phase (mirrors training ref-dropout).
+        self.vla_ref: bool = True
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -202,6 +205,7 @@ class ChunkACPolicy(PreTrainedPolicy):
                 action_dim=self.config.action_dim,
                 proprio_dim=self.config.proprio_dim,
                 chunk_exec_steps=self.config.chunk_exec_steps,
+                vla_ref=self.vla_ref,
             )
             self._prefix_capture = PrefixOutputCapture(
                 token_pool_size=self.config.token_pool_size,
@@ -211,23 +215,26 @@ class ChunkACPolicy(PreTrainedPolicy):
             self._prefix_capture.attach(self._rl_token_policy._pi05)
         return self.modifier
 
-    def _build_phase_controller(self) -> PhaseController:
-        # Bridge: ChunkACPolicyConfig.phase_mode encodes the deploy policy
-        # (always_rl / always_vla / manual). PhaseController itself only
-        # accepts manual or learned (= how transitions happen). For
-        # always_* we still use manual mode and just pin the initial phase.
-        mode = self.config.phase_mode
-        if mode == "always_rl":
-            ctrl = PhaseController(mode="manual")
+    def _apply_phase_mode(self, ctrl: PhaseController) -> None:
+        """Pin the phase controller to the phase encoded by phase_mode.
+
+        always_rl -> critical, always_vla -> vla, manual -> left as-is. Must be
+        re-applied after every reset(): modifier.reset() drops the controller
+        back to VLA, which would otherwise silently disable always_rl from the
+        second episode onward (record_loop resets the policy each episode).
+        """
+        if self.config.phase_mode == "always_rl":
             ctrl.trigger_critical()
-            return ctrl
-        if mode == "always_vla":
-            ctrl = PhaseController(mode="manual")
+        elif self.config.phase_mode == "always_vla":
             ctrl.trigger_vla()
-            return ctrl
-        if mode == "manual":
-            return PhaseController(mode="manual")
-        raise ValueError(f"Unknown phase_mode: {mode!r}")
+
+    def _build_phase_controller(self) -> PhaseController:
+        # ChunkACPolicyConfig.phase_mode (always_rl / always_vla / manual) is
+        # validated in the config __post_init__. PhaseController only does
+        # manual/learned transitions, so we pin the deploy phase explicitly.
+        ctrl = PhaseController(mode="manual")
+        self._apply_phase_mode(ctrl)
+        return ctrl
 
     def _compute_num_image_tokens(self) -> int:
         pi05 = self._rl_token_policy._pi05
@@ -258,6 +265,9 @@ class ChunkACPolicy(PreTrainedPolicy):
     def reset(self) -> None:
         if self.modifier is not None:
             self.modifier.reset()
+            # modifier.reset() resets the phase controller to VLA; re-pin the
+            # configured deploy phase so always_rl survives episode resets.
+            self._apply_phase_mode(self.modifier.phase_ctrl)
 
     def get_optim_params(self) -> list:
         return [
