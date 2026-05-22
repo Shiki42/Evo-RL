@@ -71,6 +71,7 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     chunk_exec_steps: int = 25
     phase_mode: str = "always_rl"
     deterministic: bool = True
+    vla_ref: bool = True
 
     # --- Observation mapping (for deploy preprocessor) ---
     camera_keys: list[str] = field(default_factory=lambda: list(_DEFAULT_CAMERA_KEYS))

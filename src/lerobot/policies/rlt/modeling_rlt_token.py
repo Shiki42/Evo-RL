@@ -130,6 +130,7 @@ class RLTokenPolicy(PreTrainedPolicy):
             ff_dim=config.rl_token_ff_dim,
             num_rl_tokens=config.rl_token_num_rl_tokens,
             inference_only=False,
+            init_scale=config.rl_token_init_scale,
         )
 
         pi05 = self._load_pi05_backbone()

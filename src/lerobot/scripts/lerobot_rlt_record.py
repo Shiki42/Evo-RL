@@ -566,8 +566,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         # Load pretrained policy
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
         from lerobot.policies.rlt.modeling_rlt_ac import ChunkACPolicy
+
         if isinstance(policy, ChunkACPolicy):
-            policy.vla_ref = cfg.vla_ref
+            policy.config.vla_ref = cfg.vla_ref
             logging.info("rlt_ac vla_ref=%s (False => zeroed VLA reference chunk)", cfg.vla_ref)
         preprocessor = None
         postprocessor = None
