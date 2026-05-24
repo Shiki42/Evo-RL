@@ -30,10 +30,10 @@ class RLTokenPolicyConfig(PreTrainedConfig):
 
     # --- RL Token encoder + decoder ---
     rl_token_dim: int = 2048
-    rl_token_nhead: int = 8
-    rl_token_enc_layers: int = 3
-    rl_token_dec_layers: int = 3
-    rl_token_ff_dim: int = 4096
+    rl_token_nhead: int = 16
+    rl_token_enc_layers: int = 4
+    rl_token_dec_layers: int = 4
+    rl_token_ff_dim: int = 8192
     rl_token_num_rl_tokens: int = 1
     rl_token_init_scale: float = 0.02
 
@@ -46,7 +46,7 @@ class RLTokenPolicyConfig(PreTrainedConfig):
     # --- Loss weights ---
     recon_weight: float = 1.0
     vla_ft_weight: float = 0.0
-    norm_gamma: float = 0.0
+    norm_gamma: float = 0.25
     norm_stats_path: str | None = None
 
     # --- Per-group learning rates (joint training; used when vla_ft_weight>0) ---
@@ -114,7 +114,7 @@ class RLTokenPolicyConfig(PreTrainedConfig):
             peak_lr=2e-4,
             decay_lr=5e-6,
             num_warmup_steps=200,
-            num_decay_steps=5000,
+            num_decay_steps=60000,
         )
 
     @property
