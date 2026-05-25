@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
+import time
+from collections import deque
+from threading import Lock, Thread
 from typing import Any
 
 import torch
@@ -9,6 +13,9 @@ from torch import Tensor
 from typing_extensions import Unpack
 
 from lerobot.policies.pretrained import ActionSelectKwargs, PreTrainedPolicy
+from lerobot.policies.rtc.action_queue import ActionQueue
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.rtc.latency_tracker import LatencyTracker
 from lerobot.policies.rlt.action_modifier import PrefixOutputCapture, RLTActionModifier
 from lerobot.policies.rlt.configuration_rlt_ac import ChunkACPolicyConfig
 from lerobot.policies.rlt.modeling_rlt_token import RLTokenPolicy
@@ -93,6 +100,18 @@ class ChunkACPolicy(PreTrainedPolicy):
         # Deploy toggle (set by lerobot_rlt_record). False => the actor sees a
         # zeroed VLA reference chunk in RL phase (mirrors training ref-dropout).
         self.vla_ref: bool = True
+        self._rtc_config: RTCConfig | None = None
+        self._rtc_action_queue: ActionQueue | None = None
+        self._rtc_latency_tracker: LatencyTracker | None = None
+        self._rtc_fps: float = 30.0
+        self._rtc_action_queue_size_to_get_new_actions: int = 0
+        self._rtc_worker: Thread | None = None
+        self._rtc_worker_error: Exception | None = None
+        self._rtc_generation: int = 0
+        self._rtc_lock = Lock()
+        self._rtc_inference_lock = Lock()
+        self._rtc_step_metadata: deque[Any] = deque()
+        self._rtc_selected_step_metadata: deque[Any] = deque()
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -243,6 +262,247 @@ class ChunkACPolicy(PreTrainedPolicy):
         tokens_per_camera = (self.config.image_resolution[0] // vision_cfg.patch_size) ** 2
         return tokens_per_camera * len(self.config.camera_keys)
 
+    def configure_rtc(
+        self,
+        rtc_config: RTCConfig,
+        fps: float,
+        action_queue_size_to_get_new_actions: int | None = None,
+    ) -> None:
+        """Enable RTC chunk replacement for deployment-time ``select_action``.
+
+        ``predict_action_chunk`` already forwards RTC kwargs into the frozen pi0.5
+        backbone. This runtime keeps an overlapping action queue so those kwargs
+        contain the previous chunk leftovers and measured inference delay.
+        """
+        if fps <= 0:
+            raise ValueError(f"fps must be positive, got {fps}")
+
+        pi05 = self._rl_token_policy._pi05
+        pi05.config.rtc_config = rtc_config
+        pi05.init_rtc_processor()
+
+        self._rtc_config = rtc_config
+        self._rtc_action_queue = ActionQueue(rtc_config)
+        self._rtc_latency_tracker = LatencyTracker()
+        self._rtc_fps = float(fps)
+        if action_queue_size_to_get_new_actions is None:
+            action_queue_size_to_get_new_actions = max(1, self.config.chunk_length - 1)
+        self._rtc_action_queue_size_to_get_new_actions = action_queue_size_to_get_new_actions
+        self._rtc_worker = None
+        self._rtc_worker_error = None
+        self._rtc_generation = 0
+        self._rtc_step_metadata.clear()
+        self._rtc_selected_step_metadata.clear()
+
+    @property
+    def _rtc_runtime_enabled(self) -> bool:
+        return self._rtc_config is not None
+
+    def _clone_rtc_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        cloned: dict[str, Any] = {}
+        for key, value in batch.items():
+            if isinstance(value, Tensor):
+                cloned[key] = value.detach().clone()
+            elif isinstance(value, list):
+                cloned[key] = list(value)
+            else:
+                cloned[key] = copy.deepcopy(value)
+        return cloned
+
+    def _raise_rtc_worker_error(self) -> None:
+        if self._rtc_worker_error is None:
+            return
+        error = self._rtc_worker_error
+        self._rtc_worker_error = None
+        raise error
+
+    def _join_finished_rtc_worker(self) -> None:
+        if self._rtc_worker is None or self._rtc_worker.is_alive():
+            return
+        self._rtc_worker.join()
+        self._rtc_worker = None
+
+    def _wait_for_rtc_worker(self) -> None:
+        if self._rtc_worker is None:
+            return
+        self._rtc_worker.join()
+        self._rtc_worker = None
+        self._raise_rtc_worker_error()
+
+    def _reset_rtc_runtime(self) -> None:
+        with self._rtc_lock:
+            self._rtc_generation += 1
+            if self._rtc_action_queue is not None:
+                self._rtc_action_queue = ActionQueue(self._rtc_action_queue.cfg)
+            if self._rtc_latency_tracker is not None:
+                self._rtc_latency_tracker.reset()
+            self._rtc_step_metadata.clear()
+            self._rtc_selected_step_metadata.clear()
+            self._rtc_worker_error = None
+        self._join_finished_rtc_worker()
+
+    def _prepare_rtc_request(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[dict[str, Any], Tensor | None, int, int, float, int]:
+        if self._rtc_action_queue is None or self._rtc_latency_tracker is None:
+            raise RuntimeError("RTC runtime is not configured")
+
+        time_per_chunk = 1.0 / self._rtc_fps
+        with self._rtc_lock:
+            prev_actions = self._rtc_action_queue.get_left_over()
+            if prev_actions is not None:
+                prev_actions = prev_actions.clone()
+            action_index_before_inference = self._rtc_action_queue.get_action_index()
+            generation = self._rtc_generation
+        inference_delay = math.ceil(self._rtc_latency_tracker.max() / time_per_chunk)
+        return (
+            self._clone_rtc_batch(batch),
+            prev_actions,
+            inference_delay,
+            action_index_before_inference,
+            time.perf_counter(),
+            generation,
+        )
+
+    def _predict_and_merge_rtc_chunk(
+        self,
+        batch: dict[str, Tensor],
+        prev_actions: Tensor | None,
+        inference_delay: int,
+        action_index_before_inference: int,
+        request_start_time: float,
+        generation: int,
+    ) -> None:
+        if self._rtc_action_queue is None or self._rtc_latency_tracker is None or self._rtc_config is None:
+            raise RuntimeError("RTC runtime is not configured")
+        if generation != self._rtc_generation:
+            return
+
+        with self._rtc_inference_lock:
+            if generation != self._rtc_generation:
+                return
+            mod = self._ensure_modifier()
+            mod._step_metadata.clear()
+            chunk = self.predict_action_chunk(
+                batch,
+                inference_delay=inference_delay,
+                prev_chunk_left_over=prev_actions,
+            )
+            if chunk.shape[0] != 1:
+                raise ValueError(f"RTC deployment expects batch size 1, got {chunk.shape[0]}")
+
+            original_actions = chunk.squeeze(0).detach()
+            step_metadata = list(mod._step_metadata)
+            mod._step_metadata.clear()
+        if len(step_metadata) != len(original_actions):
+            raise RuntimeError(
+                f"RTC metadata/action length mismatch: {len(step_metadata)} != {len(original_actions)}"
+            )
+
+        new_latency = time.perf_counter() - request_start_time
+        time_per_chunk = 1.0 / self._rtc_fps
+        estimated_delay = math.ceil(new_latency / time_per_chunk)
+        self._rtc_latency_tracker.add(new_latency)
+        with self._rtc_lock:
+            if generation != self._rtc_generation:
+                return
+            real_delay = max(0, self._rtc_action_queue.get_action_index() - action_index_before_inference)
+            queue_before_merge = self._rtc_action_queue.qsize()
+            self._rtc_action_queue.merge(
+                original_actions,
+                original_actions,
+                real_delay,
+                action_index_before_inference,
+            )
+            self._rtc_step_metadata = deque(step_metadata[real_delay:])
+
+        log.info(
+            "[RLT RTC] inference latency=%.1fms (estimated_delay=%d steps, real_delay=%d steps) | "
+            "inference_delay used=%d | queue before merge=%d",
+            new_latency * 1000.0,
+            estimated_delay,
+            real_delay,
+            inference_delay,
+            queue_before_merge,
+        )
+        min_refill_threshold = self._rtc_config.execution_horizon + estimated_delay
+        if self._rtc_action_queue_size_to_get_new_actions < min_refill_threshold:
+            log.warning(
+                "[RLT RTC] action_queue_size_to_get_new_actions=%d is smaller than "
+                "execution_horizon + delay (%d + %d). The queue may run dry under load.",
+                self._rtc_action_queue_size_to_get_new_actions,
+                self._rtc_config.execution_horizon,
+                estimated_delay,
+            )
+
+    def _run_rtc_worker(
+        self,
+        batch: dict[str, Tensor],
+        prev_actions: Tensor | None,
+        inference_delay: int,
+        action_index_before_inference: int,
+        request_start_time: float,
+        generation: int,
+    ) -> None:
+        try:
+            self._predict_and_merge_rtc_chunk(
+                batch,
+                prev_actions,
+                inference_delay,
+                action_index_before_inference,
+                request_start_time,
+                generation,
+            )
+        except Exception as error:
+            with self._rtc_lock:
+                if generation == self._rtc_generation:
+                    self._rtc_worker_error = error
+
+    def _maybe_start_rtc_worker(self, batch: dict[str, Tensor]) -> None:
+        if self._rtc_action_queue is None:
+            raise RuntimeError("RTC runtime is not configured")
+        if self._rtc_worker is not None and self._rtc_worker.is_alive():
+            return
+        self._join_finished_rtc_worker()
+        self._raise_rtc_worker_error()
+        if self._rtc_action_queue.qsize() > self._rtc_action_queue_size_to_get_new_actions:
+            return
+        request = self._prepare_rtc_request(batch)
+        self._rtc_worker = Thread(target=self._run_rtc_worker, args=request, daemon=True)
+        self._rtc_worker.start()
+
+    def _select_action_rtc(self, batch: dict[str, Tensor]) -> Tensor:
+        if self._rtc_action_queue is None:
+            raise RuntimeError("RTC runtime is not configured")
+
+        self._join_finished_rtc_worker()
+        self._raise_rtc_worker_error()
+        computed_sync = False
+        if self._rtc_action_queue.empty():
+            self._wait_for_rtc_worker()
+            self._raise_rtc_worker_error()
+        if self._rtc_action_queue.empty():
+            self._predict_and_merge_rtc_chunk(*self._prepare_rtc_request(batch))
+            computed_sync = True
+
+        with self._rtc_lock:
+            action = self._rtc_action_queue.get()
+            step_metadata = self._rtc_step_metadata.popleft() if self._rtc_step_metadata else None
+        if action is None:
+            self._predict_and_merge_rtc_chunk(*self._prepare_rtc_request(batch))
+            with self._rtc_lock:
+                action = self._rtc_action_queue.get()
+                step_metadata = self._rtc_step_metadata.popleft() if self._rtc_step_metadata else None
+        if action is None:
+            raise RuntimeError("RTC action queue is empty after refill")
+        if step_metadata is None:
+            raise RuntimeError("RTC metadata queue is empty after action pop")
+        self._rtc_selected_step_metadata.append(step_metadata)
+
+        if not computed_sync:
+            self._maybe_start_rtc_worker(batch)
+        return action.unsqueeze(0)
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         self.eval()
@@ -256,6 +516,9 @@ class ChunkACPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+        if self._rtc_runtime_enabled:
+            return self._select_action_rtc(batch)
+
         mod = self._ensure_modifier()
         if mod.needs_new_chunk:
             chunk = self.predict_action_chunk(batch, **kwargs)
@@ -263,11 +526,43 @@ class ChunkACPolicy(PreTrainedPolicy):
         return mod.pop_action()
 
     def reset(self) -> None:
+        if self._rtc_runtime_enabled:
+            self._reset_rtc_runtime()
         if self.modifier is not None:
             self.modifier.reset()
             # modifier.reset() resets the phase controller to VLA; re-pin the
             # configured deploy phase so always_rl survives episode resets.
             self._apply_phase_mode(self.modifier.phase_ctrl)
+
+    def set_rl_mode(self) -> None:
+        if self._rtc_runtime_enabled:
+            self._reset_rtc_runtime()
+        self._ensure_modifier().set_rl_mode()
+
+    def set_vla_mode(self) -> None:
+        if self._rtc_runtime_enabled:
+            self._reset_rtc_runtime()
+        self._ensure_modifier().set_vla_mode()
+
+    def trigger_critical_phase(self) -> None:
+        if self._rtc_runtime_enabled:
+            self._reset_rtc_runtime()
+        self._ensure_modifier().trigger_critical_phase()
+
+    def interrupt_chunk(self) -> None:
+        if self._rtc_runtime_enabled:
+            self._reset_rtc_runtime()
+        if self.modifier is not None:
+            self.modifier.interrupt_chunk()
+
+    def pop_step_metadata(self):
+        if self._rtc_runtime_enabled:
+            if len(self._rtc_selected_step_metadata) == 0:
+                return None
+            return self._rtc_selected_step_metadata.popleft()
+        if self.modifier is None:
+            return None
+        return self.modifier.pop_step_metadata()
 
     def get_optim_params(self) -> list:
         return [

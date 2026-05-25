@@ -238,6 +238,13 @@ class RLTRecordConfig:
     # to enter RL. Required for pure RL-only HIL recording where VLA should
     # never drive the robot.
     start_in_teleop: bool = False
+    # RTC deploy settings for rlt_ac. Disabled by default so existing record
+    # scripts keep the synchronous chunk queue.
+    rtc_enabled: bool = False
+    rtc_execution_horizon: int = 10
+    rtc_max_guidance_weight: float = 10.0
+    rtc_prefix_attention_schedule: str = "EXP"
+    rtc_action_queue_size_to_get_new_actions: int | None = None
 
 
 @dataclass
@@ -569,6 +576,32 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if isinstance(policy, ChunkACPolicy):
             policy.vla_ref = cfg.vla_ref
             logging.info("rlt_ac vla_ref=%s (False => zeroed VLA reference chunk)", cfg.vla_ref)
+            if cfg.rlt.rtc_enabled:
+                from lerobot.configs.types import RTCAttentionSchedule
+                from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+                rtc_config = RTCConfig(
+                    enabled=True,
+                    execution_horizon=cfg.rlt.rtc_execution_horizon,
+                    max_guidance_weight=cfg.rlt.rtc_max_guidance_weight,
+                    prefix_attention_schedule=RTCAttentionSchedule(
+                        cfg.rlt.rtc_prefix_attention_schedule
+                    ),
+                )
+                policy.configure_rtc(
+                    rtc_config,
+                    fps=cfg.dataset.fps,
+                    action_queue_size_to_get_new_actions=(
+                        cfg.rlt.rtc_action_queue_size_to_get_new_actions
+                    ),
+                )
+                logging.info(
+                    "rlt_ac RTC enabled: horizon=%d guidance=%.3f schedule=%s refill_threshold=%s",
+                    cfg.rlt.rtc_execution_horizon,
+                    cfg.rlt.rtc_max_guidance_weight,
+                    cfg.rlt.rtc_prefix_attention_schedule,
+                    cfg.rlt.rtc_action_queue_size_to_get_new_actions,
+                )
         preprocessor = None
         postprocessor = None
         if cfg.acp_inference.enable and cfg.policy is None:
