@@ -238,6 +238,9 @@ class RLTRecordConfig:
     # to enter RL. Required for pure RL-only HIL recording where VLA should
     # never drive the robot.
     start_in_teleop: bool = False
+    # Blend follower commands from the last policy action to teleop during
+    # SPACE handoff, reducing one-frame jumps when the leader is released.
+    intervention_action_blend_time_s: float = 0.0
     # RTC deploy settings for rlt_ac. Disabled by default so existing record
     # scripts keep the synchronous chunk queue.
     rtc_enabled: bool = False
@@ -418,6 +421,8 @@ class RecordConfig:
             raise ValueError("`communication_retry_timeout_s` must be >= 0.")
         if self.communication_retry_interval_s <= 0:
             raise ValueError("`communication_retry_interval_s` must be > 0.")
+        if self.rlt.intervention_action_blend_time_s < 0:
+            raise ValueError("`rlt.intervention_action_blend_time_s` must be >= 0.")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -759,6 +764,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     rl_phase_key_toggles_critical_phase=cfg.rlt.rl_phase_key_toggles_critical_phase,
                     rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
                     start_in_teleop=cfg.rlt.start_in_teleop,
+                    intervention_action_blend_time_s=cfg.rlt.intervention_action_blend_time_s,
                 )
 
                 if critical_phase_tracker is not None:

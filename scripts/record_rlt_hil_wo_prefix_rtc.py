@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Enable RTC guidance in the pi0.5 reference path.",
     )
+    p.add_argument(
+        "--intervention-action-blend-time-s",
+        type=float,
+        default=0.4,
+        help="Seconds to blend follower commands from policy to teleop after SPACE handoff.",
+    )
     p.add_argument("--rtc-execution-horizon", type=int, default=10)
     p.add_argument("--rtc-max-guidance-weight", type=float, default=10.0)
     p.add_argument(
@@ -227,6 +233,7 @@ def _build_record_argv(
         "--rlt.rl_phase_key_toggles_episode=true",
         "--rlt.start_in_teleop=true",
         f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
+        f"--rlt.intervention_action_blend_time_s={args.intervention_action_blend_time_s}",
         *_build_rtc_argv(args),
         "--enable_episode_outcome_labeling=true",
         "--intervention_state_machine_enabled=true",
@@ -250,6 +257,7 @@ def _print_run_summary(
         f"schedule={args.rtc_prefix_attention_schedule} "
         f"refill_threshold={args.rtc_action_queue_size_to_get_new_actions or 'chunk_length-1'}"
     )
+    print(f"Intervention action blend: {args.intervention_action_blend_time_s:.2f}s")
     print(
         "RLT HIL wo-prefix RTC mode: teleop->r=start RL episode; "
         "in RL: r=end success, r+r within "

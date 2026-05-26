@@ -67,6 +67,44 @@ from lerobot.utils.visualization_utils import log_rerun_data
 T = TypeVar("T")
 
 
+def _clone_robot_action(action: RobotAction) -> RobotAction:
+    cloned: RobotAction = {}
+    for key, value in action.items():
+        if isinstance(value, np.ndarray):
+            cloned[key] = value.copy()
+        else:
+            cloned[key] = value
+    return cloned
+
+
+def _blend_robot_actions(
+    action_feature_names: list[str],
+    start_action: RobotAction,
+    target_action: RobotAction,
+    alpha: float,
+) -> RobotAction:
+    clipped_alpha = min(max(alpha, 0.0), 1.0)
+    blended: RobotAction = {}
+    for name in action_feature_names:
+        start_value = start_action.get(name)
+        target_value = target_action.get(name)
+        if start_value is None:
+            blended[name] = target_value
+            continue
+        if target_value is None:
+            blended[name] = start_value
+            continue
+
+        start_array = np.asarray(start_value, dtype=np.float32)
+        target_array = np.asarray(target_value, dtype=np.float32)
+        blended_value = (1.0 - clipped_alpha) * start_array + clipped_alpha * target_array
+        if blended_value.shape == ():
+            blended[name] = float(blended_value)
+        else:
+            blended[name] = blended_value.astype(np.float32)
+    return blended
+
+
 """ --------------- record_loop() data flow --------------------------
        [ Robot ]
            V
@@ -178,7 +216,10 @@ def record_loop(
     rl_phase_key_toggles_critical_phase: bool = False,
     rl_phase_double_tap_window_s: float = 1.0,
     start_in_teleop: bool = False,
+    intervention_action_blend_time_s: float = 0.0,
 ):
+    if intervention_action_blend_time_s < 0:
+        raise ValueError("intervention_action_blend_time_s must be >= 0")
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
 
@@ -237,6 +278,9 @@ def record_loop(
     else:
         intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
+    last_policy_action_for_blend: RobotAction | None = None
+    intervention_blend_start_t: float | None = None
+    intervention_blend_start_action: RobotAction | None = None
     teleop_fallback_warned = False
 
     teleop_arm_for_mode_switch: Any | None = None
@@ -372,6 +416,16 @@ def record_loop(
                     set_teleop_manual_control(True)
                     if rlt_intervention_tracker is not None:
                         rlt_intervention_tracker.start(get_episode_frame_index())
+                    if intervention_action_blend_time_s > 0 and last_policy_action_for_blend is not None:
+                        intervention_blend_start_t = time.perf_counter()
+                        intervention_blend_start_action = _clone_robot_action(last_policy_action_for_blend)
+                        logging.info(
+                            "Intervention action blend started for %.2fs.",
+                            intervention_action_blend_time_s,
+                        )
+                    else:
+                        intervention_blend_start_t = None
+                        intervention_blend_start_action = None
                     if rlt is not None:
                         rlt.interrupt_chunk()
                         log_say("intervene", play_sounds=True)
@@ -383,6 +437,8 @@ def record_loop(
                     if rlt_intervention_tracker is not None:
                         rlt_intervention_tracker.stop(get_episode_frame_index())
                     intervention_state = INTERVENTION_STATE_RELEASE
+                    intervention_blend_start_t = None
+                    intervention_blend_start_action = None
                     set_teleop_manual_control(False)
                     if policy is not None and preprocessor is not None and postprocessor is not None:
                         policy.reset()
@@ -482,6 +538,8 @@ def record_loop(
                     # auto-promoted to POLICY on the next frame (see below).
                     if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
                         intervention_state = INTERVENTION_STATE_RELEASE
+                        intervention_blend_start_t = None
+                        intervention_blend_start_action = None
                         set_teleop_manual_control(False)
                     if rlt is not None:
                         rlt.set_rl_mode()
@@ -520,6 +578,8 @@ def record_loop(
                     if rlt_intervention_tracker is not None:
                         rlt_intervention_tracker.stop(get_episode_frame_index())
                     intervention_state = INTERVENTION_STATE_RELEASE
+                    intervention_blend_start_t = None
+                    intervention_blend_start_action = None
                     set_teleop_manual_control(False)
                 log_say("success", play_sounds=True)
                 logging.info("RL phase ended (success)")
@@ -534,6 +594,8 @@ def record_loop(
                     if rlt_intervention_tracker is not None:
                         rlt_intervention_tracker.stop(get_episode_frame_index())
                     intervention_state = INTERVENTION_STATE_RELEASE
+                    intervention_blend_start_t = None
+                    intervention_blend_start_action = None
                     set_teleop_manual_control(False)
                 log_say("failure", play_sounds=True)
                 logging.info("RL phase ended (failure)")
@@ -634,6 +696,25 @@ def record_loop(
         else:
             action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
 
+        if (
+            is_intervention
+            and intervention_blend_start_t is not None
+            and intervention_blend_start_action is not None
+            and action_values is not None
+        ):
+            elapsed_s = time.perf_counter() - intervention_blend_start_t
+            alpha = min(elapsed_s / intervention_action_blend_time_s, 1.0)
+            if alpha < 1.0:
+                action_values = _blend_robot_actions(
+                    action_feature_names,
+                    intervention_blend_start_action,
+                    action_values,
+                    alpha,
+                )
+            else:
+                intervention_blend_start_t = None
+                intervention_blend_start_action = None
+
         # Applies a pipeline to the action, default is IdentityProcessor
         robot_action_to_send = robot_action_processor((action_values, obs))
 
@@ -642,6 +723,8 @@ def record_loop(
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         selected_from_policy = act_processed_policy is not None and action_values is act_processed_policy
+        if selected_from_policy:
+            last_policy_action_for_blend = _clone_robot_action(action_values)
         _t0 = time.perf_counter()
         if policy_sync_executor is not None and selected_from_policy:
             _sent_action = run_with_connection_retry(
