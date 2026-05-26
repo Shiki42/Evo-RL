@@ -189,18 +189,24 @@ class RLTActionModifier(nn.Module):
             # multiplies ref_chunk_flat by a 0/1 mask, so a dropped sample
             # is exactly an all-zero ref. Reproduce that here.
             ref_flat = torch.zeros_like(ref_flat)
-        if self._cc_log_count < 3 or self._cc_log_count % 30 == 0:
-            # Diagnostic: raw VLA ref vs what the actor actually receives.
-            # ref-into-actor abs-sum == 0 proves vla_ref=False dropped it.
+        should_log = self._cc_log_count < 3 or self._cc_log_count % 30 == 0
+        mu, _ = self.actor(state_vec, ref_flat, training=False)
+        chunk = unflatten_chunk(mu, self.chunk_length).clamp(-1, 1)
+        if should_log:
+            delta = (chunk - ref_chunk).abs()
+            # Diagnostic: the VLA ref is only the actor input; the returned
+            # chunk below is the RLT actor output that will be executed.
             print(
-                f"[RLT vla_ref={self.vla_ref}] compute_chunk #{self._cc_log_count}: "
-                f"raw VLA ref[0,0,:4]={[round(v, 4) for v in ref_chunk[0, 0, :4].tolist()]}, "
+                f"[RLT source=RLT_ACTOR vla_ref={self.vla_ref}] "
+                f"compute_chunk #{self._cc_log_count}: "
+                f"vla_ref[0,0,:4]={[round(v, 4) for v in ref_chunk[0, 0, :4].tolist()]}, "
+                f"actor_out[0,0,:4]={[round(v, 4) for v in chunk[0, 0, :4].tolist()]}, "
+                f"mean_abs_delta={delta.mean().item():.4f}, "
+                f"max_abs_delta={delta.max().item():.4f}, "
                 f"ref-into-actor abs-sum={ref_flat.abs().sum().item():.4f}",
                 flush=True,
             )
         self._cc_log_count += 1
-        mu, _ = self.actor(state_vec, ref_flat, training=False)
-        chunk = unflatten_chunk(mu, self.chunk_length).clamp(-1, 1)
 
         self._enqueue_metadata(phase_val, source_val, self.chunk_length)
         return chunk
