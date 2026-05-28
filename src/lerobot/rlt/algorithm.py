@@ -127,6 +127,7 @@ class RLTAlgorithm:
         self.policy.to(device)
         self.critic.to(device)
         self.target_critic.to(device)
+        self.target_actor.to(device)
         return self
 
     def train(self) -> None:
@@ -134,12 +135,14 @@ class RLTAlgorithm:
         self.policy.train()
         self.critic.train()
         self.target_critic.train()
+        self.target_actor.train()
 
     def eval(self) -> None:
         """Set all sub-modules to eval mode."""
         self.policy.eval()
         self.critic.eval()
         self.target_critic.eval()
+        self.target_actor.eval()
 
     def parameters(self):
         """Iterate over all trainable parameters (policy + critic)."""
