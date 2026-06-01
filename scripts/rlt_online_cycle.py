@@ -43,7 +43,7 @@ DEFAULT_BASE_RLT_POLICY_DIR = f"{DEFAULT_BASE_DIR}/online_base_rlt_0528.pt"
 DEFAULT_TASK = "Insert the copper screw into the black sleeve."
 DEFAULT_ROBOT_REPO = "/home/kye/evo-rl"
 DEFAULT_CODER_B_REPO = "/home/coder/code/Evo-RL-quick"
-DEFAULT_ROBOT_DATASETS_ROOT = "~/.roboclaw/workspace/embodied/datasets/local"
+DEFAULT_ROBOT_DATASETS_ROOT = "~/.roboclaw/workspace/embodied/datasets"
 RESULT_PREFIX = "RLT_ONLINE_RESULT "
 
 
