@@ -582,8 +582,9 @@ def main() -> None:
     payload = json.loads(sys.stdin.read())
     check_token()
     ts = payload.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S")
-    ac_version, _ = latest_ac(payload["model_repo"], payload["base_ac_file"])
-    ac_version = payload.get("ac_version") or ac_version
+    ac_version = payload.get("ac_version")
+    if not ac_version:
+        ac_version, _ = latest_ac(payload["model_repo"], payload["base_ac_file"])
     merged_name = payload.get("dataset_name") or f"{sanitize_name(ac_version)}_{ts}"
     repo_id = payload.get("dataset_repo_id") or f"{payload['dataset_namespace']}/{merged_name}"
     source_dirs = [Path(p).expanduser().resolve() for p in payload.get("source_dirs", [])]
@@ -683,6 +684,7 @@ def remote_command(repo: str, python_bin: str, role_args: list[str]) -> str:
     return " ".join(parts)
 
 def command_cycle(args: argparse.Namespace) -> None:
+    effective_ac_version = args.ac_version or resolve_latest_ac(args.model_repo, args.base_ac_file).version
     upload_payload = {
         "model_repo": args.model_repo,
         "base_ac_file": args.base_ac_file,
@@ -694,7 +696,7 @@ def command_cycle(args: argparse.Namespace) -> None:
         "dataset_namespace": args.dataset_namespace,
         "dataset_name": args.dataset_name,
         "dataset_repo_id": args.dataset_repo_id,
-        "ac_version": args.ac_version,
+        "ac_version": effective_ac_version,
         "timestamp": args.timestamp,
         "task": args.task,
     }
