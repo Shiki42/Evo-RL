@@ -801,7 +801,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy.set_defaults(func=command_deploy_ac)
 
     cycle = sub.add_parser("cycle", help="local orchestrator: c pack -> b train -> c deploy")
-    cycle.add_argument("--model-repo", default=DEFAULT_MODEL_REPO)
+    add_common_model_args(cycle)
     cycle.add_argument("--dataset-namespace", default="Shiki42")
     cycle.add_argument("--dataset-name", default=None)
     cycle.add_argument("--dataset-repo-id", default=None)
