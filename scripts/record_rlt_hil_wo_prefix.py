@@ -46,6 +46,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.dataset.setup_helpers import (
@@ -54,6 +55,10 @@ from scripts.dataset.setup_helpers import (
     load_setup_json,
     resolve_dataset_root,
 )
+from lerobot.robots.bi_so_follower import BiSOFollower, BiSOFollowerConfig
+from lerobot.robots.so_follower import SOFollowerConfig
+from lerobot.teleoperators.bi_so_leader import BiSOLeader, BiSOLeaderConfig
+from lerobot.teleoperators.so_leader import SOLeaderConfig
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +111,68 @@ def _build_camera_configs(cameras: list[dict]) -> tuple[dict, dict]:
         elif alias in RIGHT_CAMS:
             right_cameras[new_name] = cam_cfg
     return left_cameras, right_cameras
+
+
+def _disconnect_preflight_device(device: Any) -> None:
+    for arm_name in ("left_arm", "right_arm"):
+        arm = getattr(device, arm_name, None)
+        if arm is not None and arm.is_connected:
+            arm.disconnect()
+
+    if getattr(device, "is_connected", False):
+        device.disconnect()
+
+
+def _preflight_motor_connections(
+    followers: list[dict],
+    leaders: list[dict],
+    cal_dir: str,
+    leader_cal_dir: str | None,
+) -> None:
+    log.info("Preflight checking follower motor connections before loading policy")
+    robot = BiSOFollower(
+        BiSOFollowerConfig(
+            id="bimanual",
+            calibration_dir=Path(cal_dir),
+            left_arm_config=SOFollowerConfig(
+                port=followers[0]["port"],
+                use_degrees=True,
+            ),
+            right_arm_config=SOFollowerConfig(
+                port=followers[1]["port"],
+                use_degrees=True,
+            ),
+        )
+    )
+    try:
+        robot.connect(calibrate=True)
+        log.info("Preflight follower motor check passed")
+    finally:
+        _disconnect_preflight_device(robot)
+
+    if not leaders or leader_cal_dir is None:
+        return
+
+    log.info("Preflight checking leader motor connections before loading policy")
+    teleop = BiSOLeader(
+        BiSOLeaderConfig(
+            id="bimanual_leader",
+            calibration_dir=Path(leader_cal_dir),
+            left_arm_config=SOLeaderConfig(
+                port=leaders[0]["port"],
+                use_degrees=True,
+            ),
+            right_arm_config=SOLeaderConfig(
+                port=leaders[1]["port"],
+                use_degrees=True,
+            ),
+        )
+    )
+    try:
+        teleop.connect(calibrate=True)
+        log.info("Preflight leader motor check passed")
+    finally:
+        _disconnect_preflight_device(teleop)
 
 
 def main():
@@ -185,6 +252,13 @@ def main():
                 else:
                     log.warning("Leader calibration file not found: %s", src)
             teleop_argv.append(f"--teleop.calibration_dir={leader_cal_dir.name}")
+
+        _preflight_motor_connections(
+            followers,
+            leaders if teleop_argv else [],
+            cal_dir,
+            leader_cal_dir.name if leader_cal_dir is not None else None,
+        )
 
         policy_overrides: list[str] = [f"--policy.path={args.policy_path}"]
         if args.vla_path is not None:

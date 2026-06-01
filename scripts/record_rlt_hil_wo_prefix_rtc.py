@@ -36,7 +36,10 @@ from scripts.dataset.setup_helpers import (
     load_setup_json,
     resolve_dataset_root,
 )
-from scripts.record_rlt_hil_wo_prefix import _build_camera_configs
+from scripts.record_rlt_hil_wo_prefix import (
+    _build_camera_configs,
+    _preflight_motor_connections,
+)
 
 log = logging.getLogger(__name__)
 
@@ -302,6 +305,12 @@ def main() -> None:
     with TemporaryDirectory(prefix="rlt-hil-wo-prefix-rtc-") as cal_dir:
         _stage_follower_calibrations(followers, cal_dir)
         leader_cal_dir = _stage_leader_calibrations(leaders, teleop_argv)
+        _preflight_motor_connections(
+            followers,
+            leaders if teleop_argv else [],
+            cal_dir,
+            leader_cal_dir.name if leader_cal_dir is not None else None,
+        )
         sys.argv = _build_record_argv(
             args,
             followers,
