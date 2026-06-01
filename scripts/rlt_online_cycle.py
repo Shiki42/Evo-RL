@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import shutil
@@ -142,7 +143,8 @@ def resolve_latest_ac(model_repo: str, base_file: str = DEFAULT_BASE_AC_FILE) ->
 
 
 def emit_result(result: object) -> None:
-    print(RESULT_PREFIX + json.dumps(asdict(result), sort_keys=True), flush=True)
+    payload = result if isinstance(result, dict) else asdict(result)
+    print(RESULT_PREFIX + json.dumps(payload, sort_keys=True), flush=True)
 
 
 def parse_result(stdout: str) -> dict:
@@ -175,6 +177,8 @@ def run_capture(cmd: list[str]) -> str:
 def merge_datasets(source_dirs: list[Path], output_root: Path, merged_name: str, task: str) -> Path:
     from lerobot.datasets.aggregate import aggregate_datasets
 
+    if len(source_dirs) == 1:
+        return source_dirs[0]
     if output_root.exists():
         shutil.rmtree(output_root)
     output_root.parent.mkdir(parents=True, exist_ok=True)
@@ -458,10 +462,23 @@ def command_train_upload(args: argparse.Namespace) -> TrainResult:
     print(f"[train] base_ac={ac_ref.version} path={ac_ref.hf_path}", flush=True)
     train_cache = transition_cache / "chunk_transitions_train.pt"
     val_cache = transition_cache / "chunk_transitions_val.pt"
-    if train_cache.is_file() and val_cache.is_file():
+    if train_cache.is_file() and val_cache.is_file() and not args.rebuild_cache:
         print(f"[train] reusing transition cache {transition_cache}", flush=True)
     else:
         build_transition_cache(args, dataset_root, model_snapshot, transition_cache)
+    if args.transition_passes is not None:
+        import torch
+
+        transitions = torch.load(train_cache, map_location="cpu", weights_only=False)
+        args.gradient_steps = max(1, math.ceil(len(transitions) * args.transition_passes / args.batch_size))
+        print(
+            f"[train] transition_passes={args.transition_passes} "
+            f"train_transitions={len(transitions)} batch_size={args.batch_size} "
+            f"gradient_steps={args.gradient_steps}",
+            flush=True,
+        )
+    if args.gradient_steps is None:
+        raise ValueError("set --gradient-steps or --transition-passes")
     ckpt_path = train_from_cache(args, ac_path, transition_cache, output_dir, ac_ref)
     ac_version = args.ac_version or ts
     if args.skip_upload:
@@ -498,6 +515,167 @@ def command_deploy_ac(args: argparse.Namespace) -> DeployResult:
     return result
 
 
+
+ROBOT_UPLOAD_SCRIPT = r"""
+from __future__ import annotations
+import json, shutil, sys
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+RESULT_PREFIX = "RLT_ONLINE_RESULT "
+@dataclass(frozen=True)
+class PackResult:
+    dataset_repo_id: str
+    dataset_root: str
+    merged_name: str
+    ac_version: str
+    total_episodes: int
+    total_frames: int
+def sanitize_name(value: str) -> str:
+    out, last = [], False
+    for char in value:
+        if char.isalnum() or char in {".", "-"}:
+            out.append(char); last = False
+        elif not last:
+            out.append("_"); last = True
+    return "".join(out).strip("._-") or "rlt_online"
+def load_info(path: Path) -> dict:
+    return json.loads((path / "meta" / "info.json").read_text())
+def summarize(path: Path) -> tuple[int, int]:
+    info = load_info(path)
+    return int(info.get("total_episodes", 0)), int(info.get("total_frames", 0))
+def discover(root: Path, prefixes: list[str], max_datasets: int | None) -> list[Path]:
+    dirs = [p.parents[1] for p in sorted(root.expanduser().rglob("meta/info.json"))]
+    dirs = [p for p in dirs if any(p.name.startswith(prefix) for prefix in prefixes)]
+    dirs = [p for p in dirs if load_info(p).get("total_episodes", 0) > 0]
+    dirs.sort(key=lambda p: p.stat().st_mtime)
+    return dirs if max_datasets is None else dirs[-max_datasets:]
+def latest_ac(model_repo: str, base_file: str) -> tuple[str, str]:
+    from huggingface_hub import HfApi
+    files = HfApi().list_repo_files(model_repo, repo_type="model")
+    candidates = [f for f in files if f.startswith("ac_checkpoint/") and f.endswith("/rl_checkpoint.pt")]
+    if candidates:
+        selected = sorted(candidates)[-1]
+        return selected.removeprefix("ac_checkpoint/").removesuffix("/rl_checkpoint.pt"), selected
+    return Path(base_file).stem, base_file
+def check_token() -> None:
+    token = Path.home() / ".cache" / "huggingface" / "token"
+    if not token.is_file() or token.stat().st_size == 0:
+        raise RuntimeError(f"missing Hugging Face token at {token}")
+def merge(source_dirs: list[Path], output_root: Path, merged_name: str) -> Path:
+    if len(source_dirs) == 1:
+        return source_dirs[0]
+    sys.path.insert(0, "/home/kye/evo-rl/src")
+    from lerobot.datasets.aggregate import aggregate_datasets
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+    aggregate_datasets(
+        repo_ids=[f"local/{p.name}" for p in source_dirs],
+        aggr_repo_id=f"local/{merged_name}",
+        roots=source_dirs,
+        aggr_root=output_root,
+    )
+    return output_root
+def main() -> None:
+    from huggingface_hub import HfApi
+    payload = json.loads(sys.stdin.read())
+    check_token()
+    ts = payload.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    ac_version, _ = latest_ac(payload["model_repo"], payload["base_ac_file"])
+    ac_version = payload.get("ac_version") or ac_version
+    merged_name = payload.get("dataset_name") or f"{sanitize_name(ac_version)}_{ts}"
+    repo_id = payload.get("dataset_repo_id") or f"{payload['dataset_namespace']}/{merged_name}"
+    source_dirs = [Path(p).expanduser().resolve() for p in payload.get("source_dirs", [])]
+    if not source_dirs:
+        source_dirs = discover(
+            Path(payload["datasets_root"]),
+            payload["source_prefix"],
+            payload["max_datasets"],
+        )
+    if not source_dirs:
+        raise ValueError("no source LeRobot datasets found for upload")
+    missing = [str(p) for p in source_dirs if not (p / "meta" / "info.json").is_file()]
+    if missing:
+        raise ValueError(f"not LeRobot dataset dirs: {missing}")
+    dataset_root = merge(source_dirs, Path(payload["output_root"]).expanduser() / merged_name, merged_name)
+    print(f"[robot-upload] repo_id={repo_id}", flush=True)
+    print(f"[robot-upload] dataset_root={dataset_root}", flush=True)
+    api = HfApi()
+    api.create_repo(repo_id=repo_id, repo_type="dataset", private=True, exist_ok=True)
+    api.upload_folder(repo_id=repo_id, repo_type="dataset", folder_path=str(dataset_root))
+    total_eps, total_frames = summarize(dataset_root)
+    result = PackResult(repo_id, str(dataset_root), merged_name, ac_version, total_eps, total_frames)
+    print(RESULT_PREFIX + json.dumps(asdict(result), sort_keys=True), flush=True)
+if __name__ == "__main__":
+    main()
+"""
+ROBOT_DEPLOY_SCRIPT = r"""
+from __future__ import annotations
+import json, shutil, sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+RESULT_PREFIX = "RLT_ONLINE_RESULT "
+@dataclass(frozen=True)
+class DeployResult:
+    ac_version: str
+    checkpoint_hf_path: str
+    checkpoint_local_path: str
+    latest_symlink: str
+def check_token() -> None:
+    token = Path.home() / ".cache" / "huggingface" / "token"
+    if not token.is_file() or token.stat().st_size == 0:
+        raise RuntimeError(f"missing Hugging Face token at {token}")
+def latest_ac(model_repo: str, base_file: str) -> tuple[str, str]:
+    from huggingface_hub import HfApi
+    files = HfApi().list_repo_files(model_repo, repo_type="model")
+    candidates = [f for f in files if f.startswith("ac_checkpoint/") and f.endswith("/rl_checkpoint.pt")]
+    if candidates:
+        selected = sorted(candidates)[-1]
+        return selected.removeprefix("ac_checkpoint/").removesuffix("/rl_checkpoint.pt"), selected
+    return Path(base_file).stem, base_file
+def main() -> None:
+    from huggingface_hub import hf_hub_download
+    payload = json.loads(sys.stdin.read())
+    check_token()
+    checkpoint_hf_path = payload.get("checkpoint_hf_path")
+    if checkpoint_hf_path:
+        ac_version = Path(checkpoint_hf_path).parent.name
+    else:
+        ac_version, checkpoint_hf_path = latest_ac(payload["model_repo"], payload["base_ac_file"])
+    ckpt = Path(hf_hub_download(payload["model_repo"], filename=checkpoint_hf_path, repo_type="model"))
+    deploy_dir = Path(payload["deploy_dir"]).expanduser() / ac_version
+    deploy_dir.mkdir(parents=True, exist_ok=True)
+    local_ckpt = deploy_dir / "rl_checkpoint.pt"
+    shutil.copy2(ckpt, local_ckpt)
+    latest = Path(payload["latest_symlink"]).expanduser()
+    latest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = latest.with_suffix(".tmp")
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    tmp.symlink_to(local_ckpt)
+    tmp.replace(latest)
+    result = DeployResult(ac_version, checkpoint_hf_path, str(local_ckpt), str(latest))
+    print(RESULT_PREFIX + json.dumps(asdict(result), sort_keys=True), flush=True)
+if __name__ == "__main__":
+    main()
+"""
+def remote_python_command(python_bin: str, script_name: str, script: str, payload: dict) -> str:
+    payload_text = json.dumps(payload, sort_keys=True)
+    tmp_path = f"/tmp/{script_name}.py"
+    return "\n".join([
+        f"cat > {shlex.quote(tmp_path)} <<'PY'",
+        script,
+        "PY",
+        f"{shlex.quote(python_bin)} {shlex.quote(tmp_path)} <<'JSON'",
+        payload_text,
+        "JSON",
+    ])
+def robot_upload_command(python_bin: str, payload: dict) -> str:
+    return remote_python_command(python_bin, "rlt_online_upload_dataset", ROBOT_UPLOAD_SCRIPT, payload)
+def robot_deploy_command(python_bin: str, payload: dict) -> str:
+    return remote_python_command(python_bin, "rlt_online_deploy_ac", ROBOT_DEPLOY_SCRIPT, payload)
+
 def remote_command(repo: str, python_bin: str, role_args: list[str]) -> str:
     script = Path(repo) / "scripts" / "rlt_online_cycle.py"
     parts = ["cd", shlex.quote(repo), "&&", shlex.quote(python_bin), shlex.quote(str(script))]
@@ -505,45 +683,56 @@ def remote_command(repo: str, python_bin: str, role_args: list[str]) -> str:
     return " ".join(parts)
 
 def command_cycle(args: argparse.Namespace) -> None:
-    pack_args = [
-        "pack-upload",
-        "--datasets-root", args.robot_datasets_root,
-        "--output-root", args.robot_merged_root,
-        "--model-repo", args.model_repo,
-        "--dataset-namespace", args.dataset_namespace,
-        "--max-datasets", str(args.max_datasets),
-        "--task", args.task,
-    ]
-    for prefix in args.source_prefix:
-        pack_args.extend(["--source-prefix", prefix])
-    pack_cmd = remote_command(args.robot_repo, args.robot_python, pack_args)
-    pack_stdout = run_capture([args.ssh_connect, "c", "--cmd", pack_cmd])
+    upload_payload = {
+        "model_repo": args.model_repo,
+        "base_ac_file": args.base_ac_file,
+        "datasets_root": args.robot_datasets_root,
+        "source_dirs": args.source_dirs,
+        "source_prefix": args.source_prefix,
+        "max_datasets": args.max_datasets,
+        "output_root": args.robot_merged_root,
+        "dataset_namespace": args.dataset_namespace,
+        "dataset_name": args.dataset_name,
+        "dataset_repo_id": args.dataset_repo_id,
+        "ac_version": args.ac_version,
+        "timestamp": args.timestamp,
+        "task": args.task,
+    }
+    pack_cmd = robot_upload_command(args.robot_python, upload_payload)
+    pack_stdout = run_capture([args.ssh_connect, args.robot_alias, "--cmd", pack_cmd])
     pack = parse_result(pack_stdout)
 
     train_args = [
         "train-upload",
         "--dataset-repo-id", pack["dataset_repo_id"],
         "--model-repo", args.model_repo,
-        "--gradient-steps", str(args.gradient_steps),
+        "--batch-size", str(args.batch_size),
+        "--log-every", str(args.log_every),
+        "--eval-batches", str(args.eval_batches),
         "--task", args.task,
     ]
+    if args.transition_passes is not None:
+        train_args.extend(["--transition-passes", str(args.transition_passes)])
+    else:
+        train_args.extend(["--gradient-steps", str(args.gradient_steps)])
     if args.train_max_episodes is not None:
         train_args.extend(["--max-episodes", str(args.train_max_episodes)])
+    train_args.extend(["--ac-version", args.ac_version or pack["merged_name"]])
     train_cmd = remote_command(args.coder_b_repo, args.coder_b_python, train_args)
-    train_stdout = run_capture([args.coder_connect, "b", "--cmd", train_cmd])
+    train_stdout = run_capture([args.coder_connect, args.coder_alias, "--cmd", train_cmd])
     train = parse_result(train_stdout)
 
-    deploy_args = [
-        "deploy-ac",
-        "--model-repo", args.model_repo,
-        "--deploy-dir", args.robot_deploy_dir,
-        "--latest-symlink", args.robot_latest_symlink,
-    ]
-    deploy_cmd = remote_command(args.robot_repo, args.robot_python, deploy_args)
-    deploy_stdout = run_capture([args.ssh_connect, "c", "--cmd", deploy_cmd])
+    deploy_payload = {
+        "model_repo": args.model_repo,
+        "base_ac_file": args.base_ac_file,
+        "checkpoint_hf_path": train["checkpoint_hf_path"],
+        "deploy_dir": args.robot_deploy_dir,
+        "latest_symlink": args.robot_latest_symlink,
+    }
+    deploy_cmd = robot_deploy_command(args.robot_python, deploy_payload)
+    deploy_stdout = run_capture([args.ssh_connect, args.robot_alias, "--cmd", deploy_cmd])
     deploy = parse_result(deploy_stdout)
     print(json.dumps({"pack": pack, "train": train, "deploy": deploy}, indent=2, sort_keys=True))
-
 
 def add_common_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-repo", default=DEFAULT_MODEL_REPO)
@@ -591,7 +780,8 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--num-workers", type=int, default=2)
     train.add_argument("--train-ratio", type=float, default=0.9)
     train.add_argument("--max-episodes", type=int, default=None)
-    train.add_argument("--gradient-steps", type=int, default=200)
+    train.add_argument("--gradient-steps", type=int, default=None)
+    train.add_argument("--transition-passes", type=float, default=None)
     train.add_argument("--batch-size", type=int, default=256)
     train.add_argument("--log-every", type=int, default=20)
     train.add_argument("--eval-every", type=int, default=100)
@@ -601,6 +791,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--actor-lr", type=float, default=None)
     train.add_argument("--critic-lr", type=float, default=None)
     train.add_argument("--skip-upload", action="store_true")
+    train.add_argument("--rebuild-cache", action="store_true")
     train.set_defaults(func=command_train_upload)
 
     deploy = sub.add_parser("deploy-ac", help="download newest AC ckpt on robot and update symlink")
@@ -612,16 +803,27 @@ def build_parser() -> argparse.ArgumentParser:
     cycle = sub.add_parser("cycle", help="local orchestrator: c pack -> b train -> c deploy")
     cycle.add_argument("--model-repo", default=DEFAULT_MODEL_REPO)
     cycle.add_argument("--dataset-namespace", default="Shiki42")
+    cycle.add_argument("--dataset-name", default=None)
+    cycle.add_argument("--dataset-repo-id", default=None)
+    cycle.add_argument("--source-dirs", nargs="*", default=[])
     cycle.add_argument("--source-prefix", action="append", default=["eval_rlt_hil_wo_prefix_"])
     cycle.add_argument("--max-datasets", type=int, default=8)
+    cycle.add_argument("--transition-passes", type=float, default=2.0)
     cycle.add_argument("--gradient-steps", type=int, default=200)
+    cycle.add_argument("--batch-size", type=int, default=64)
     cycle.add_argument("--train-max-episodes", type=int, default=None)
+    cycle.add_argument("--log-every", type=int, default=1)
+    cycle.add_argument("--eval-batches", type=int, default=2)
+    cycle.add_argument("--timestamp", default=None)
+    cycle.add_argument("--ac-version", default=None)
     cycle.add_argument("--task", default=DEFAULT_TASK)
     cycle.add_argument("--ssh-connect", default="/Users/shuyuan/.codex/skills/ssh/scripts/connect.sh")
     cycle.add_argument("--coder-connect", default="/Users/shuyuan/.codex/skills/coder/scripts/connect.sh")
+    cycle.add_argument("--robot-alias", default="c")
+    cycle.add_argument("--coder-alias", default="b")
     cycle.add_argument("--robot-repo", default=DEFAULT_ROBOT_REPO)
     cycle.add_argument("--coder-b-repo", default=DEFAULT_CODER_B_REPO)
-    cycle.add_argument("--robot-python", default="python")
+    cycle.add_argument("--robot-python", default="/home/kye/miniconda3/bin/python")
     cycle.add_argument("--coder-b-python", default="/home/coder/venv-lerobot/bin/python")
     cycle.add_argument("--robot-datasets-root", default=DEFAULT_ROBOT_DATASETS_ROOT)
     cycle.add_argument("--robot-merged-root", default="~/.cache/rlt_online/merged")
