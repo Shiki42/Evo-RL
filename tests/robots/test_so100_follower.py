@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from lerobot.motors import MotorCalibration
 from lerobot.robots.so_follower import (
     SO100Follower,
     SO100FollowerConfig,
@@ -86,6 +87,25 @@ def test_connect_disconnect(follower):
 
     follower.disconnect()
     assert not follower.is_connected
+
+
+def test_connect_restores_calibration_file_on_mismatch(follower, monkeypatch):
+    calibration = {
+        motor: MotorCalibration(id=bus_motor.id, drive_mode=0, homing_offset=0, range_min=0, range_max=4095)
+        for motor, bus_motor in follower.bus.motors.items()
+    }
+    follower.calibration = calibration
+    follower.bus.is_calibrated = False
+    follower.bus.write_calibration.side_effect = lambda _calibration: setattr(
+        follower.bus, "is_calibrated", True
+    )
+    calibrate = MagicMock()
+    monkeypatch.setattr(follower, "calibrate", calibrate)
+
+    follower.connect()
+
+    follower.bus.write_calibration.assert_called_once_with(calibration)
+    calibrate.assert_not_called()
 
 
 def test_get_observation(follower):

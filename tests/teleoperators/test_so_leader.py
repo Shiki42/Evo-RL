@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from lerobot.motors import MotorCalibration
 from lerobot.teleoperators.so_leader import SO100Leader, SO100LeaderConfig
 
 
@@ -76,6 +77,25 @@ def test_connect_disconnect(leader):
     assert leader.is_connected
     leader.disconnect()
     assert not leader.is_connected
+
+
+def test_connect_restores_calibration_file_on_mismatch(leader, monkeypatch):
+    calibration = {
+        motor: MotorCalibration(id=bus_motor.id, drive_mode=0, homing_offset=0, range_min=0, range_max=4095)
+        for motor, bus_motor in leader.bus.motors.items()
+    }
+    leader.calibration = calibration
+    leader.bus.is_calibrated = False
+    leader.bus.write_calibration.side_effect = lambda _calibration: setattr(
+        leader.bus, "is_calibrated", True
+    )
+    calibrate = MagicMock()
+    monkeypatch.setattr(leader, "calibrate", calibrate)
+
+    leader.connect()
+
+    leader.bus.write_calibration.assert_called_once_with(calibration)
+    calibrate.assert_not_called()
 
 
 def test_get_action(leader):

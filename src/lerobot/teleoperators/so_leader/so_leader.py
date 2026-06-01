@@ -74,7 +74,9 @@ class SOLeader(Teleoperator):
             logger.info(
                 "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
             )
-            self.calibrate()
+            restored = self._restore_calibration_from_file()
+            if not restored or not self.is_calibrated:
+                self.calibrate()
 
         self.configure()
         logger.info(f"{self} connected.")
@@ -83,6 +85,18 @@ class SOLeader(Teleoperator):
     def is_calibrated(self) -> bool:
         return self.bus.is_calibrated
 
+    def _restore_calibration_from_file(self) -> bool:
+        if not self.calibration:
+            return False
+
+        logger.info(
+            "Writing calibration file associated with the id %s to the motors: %s",
+            self.id,
+            self.calibration_fpath,
+        )
+        self.bus.write_calibration(self.calibration)
+        return True
+
     def calibrate(self) -> None:
         if self.calibration:
             # Calibration file exists, ask user whether to use it or run new calibration
@@ -90,8 +104,7 @@ class SOLeader(Teleoperator):
                 f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
             )
             if user_input.strip().lower() != "c":
-                logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
-                self.bus.write_calibration(self.calibration)
+                self._restore_calibration_from_file()
                 return
 
         logger.info(f"\nRunning calibration of {self}")
