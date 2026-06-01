@@ -710,6 +710,10 @@ def scp_to_robot(args: argparse.Namespace, local_path: Path, remote_path: str) -
     ])
 
 
+def cleanup_robot_script(args: argparse.Namespace, script_name: str) -> None:
+    cmd = "pkill -TERM -f " + shlex.quote(f"/tmp/{script_name}[.]py") + " || true"
+    run_capture([args.ssh_connect, args.robot_alias, "--cmd", cmd], timeout_s=10)
+
 def pack_upload_via_local_relay(args: argparse.Namespace, ac_version: str) -> dict:
     if not args.source_dirs:
         raise ValueError("relay upload requires explicit --source-dirs")
@@ -760,6 +764,7 @@ def upload_dataset_for_cycle(
         if args.robot_upload_mode == "hf":
             raise
         print(f"[cycle] robot HF upload failed; using local relay: {exc}", flush=True)
+        cleanup_robot_script(args, "rlt_online_upload_dataset")
         return pack_upload_via_local_relay(args, ac_version)
 
 
@@ -809,6 +814,7 @@ def deploy_ac_for_cycle(args: argparse.Namespace, train: dict) -> dict:
         if args.robot_deploy_mode == "hf":
             raise
         print(f"[cycle] robot HF deploy failed; using local relay: {exc}", flush=True)
+        cleanup_robot_script(args, "rlt_online_deploy_ac")
         return deploy_ac_via_local_relay(args, train)
 
 
@@ -817,7 +823,6 @@ def remote_command(repo: str, python_bin: str, role_args: list[str]) -> str:
     parts = ["cd", shlex.quote(repo), "&&", shlex.quote(python_bin), shlex.quote(str(script))]
     parts.extend(shlex.quote(part) for part in role_args)
     return " ".join(parts)
-
 def command_cycle(args: argparse.Namespace) -> None:
     effective_ac_version = args.ac_version or resolve_latest_ac(args.model_repo, args.base_ac_file).version
     upload_payload = {
@@ -858,7 +863,6 @@ def command_cycle(args: argparse.Namespace) -> None:
     train = parse_result(train_stdout)
     deploy = deploy_ac_for_cycle(args, train)
     print(json.dumps({"pack": pack, "train": train, "deploy": deploy}, indent=2, sort_keys=True))
-
 def add_common_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-repo", default=DEFAULT_MODEL_REPO)
     parser.add_argument("--base-dir", default=DEFAULT_BASE_DIR)
