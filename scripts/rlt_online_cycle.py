@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -164,10 +165,16 @@ def run_checked(
     return subprocess.run(cmd, cwd=cwd, env=env, check=True, text=True)
 
 
-def run_capture(cmd: list[str]) -> str:
+def run_capture(cmd: list[str], timeout_s: int | None = None) -> str:
     printable = " ".join(shlex.quote(part) for part in cmd)
     print(f"[remote] {printable}", flush=True)
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    proc = subprocess.run(
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
     if proc.stderr:
         print(proc.stderr, file=sys.stderr, end="")
     print(proc.stdout, end="")
@@ -636,15 +643,20 @@ def latest_ac(model_repo: str, base_file: str) -> tuple[str, str]:
         return selected.removeprefix("ac_checkpoint/").removesuffix("/rl_checkpoint.pt"), selected
     return Path(base_file).stem, base_file
 def main() -> None:
-    from huggingface_hub import hf_hub_download
     payload = json.loads(sys.stdin.read())
-    check_token()
+    local_checkpoint_path = payload.get("local_checkpoint_path")
     checkpoint_hf_path = payload.get("checkpoint_hf_path")
-    if checkpoint_hf_path:
-        ac_version = Path(checkpoint_hf_path).parent.name
+    if local_checkpoint_path:
+        ac_version = payload["ac_version"]
+        ckpt = Path(local_checkpoint_path).expanduser()
     else:
-        ac_version, checkpoint_hf_path = latest_ac(payload["model_repo"], payload["base_ac_file"])
-    ckpt = Path(hf_hub_download(payload["model_repo"], filename=checkpoint_hf_path, repo_type="model"))
+        from huggingface_hub import hf_hub_download
+        check_token()
+        if checkpoint_hf_path:
+            ac_version = Path(checkpoint_hf_path).parent.name
+        else:
+            ac_version, checkpoint_hf_path = latest_ac(payload["model_repo"], payload["base_ac_file"])
+        ckpt = Path(hf_hub_download(payload["model_repo"], filename=checkpoint_hf_path, repo_type="model"))
     deploy_dir = Path(payload["deploy_dir"]).expanduser() / ac_version
     deploy_dir.mkdir(parents=True, exist_ok=True)
     local_ckpt = deploy_dir / "rl_checkpoint.pt"
@@ -677,6 +689,129 @@ def robot_upload_command(python_bin: str, payload: dict) -> str:
 def robot_deploy_command(python_bin: str, payload: dict) -> str:
     return remote_python_command(python_bin, "rlt_online_deploy_ac", ROBOT_DEPLOY_SCRIPT, payload)
 
+
+def scp_from_robot(args: argparse.Namespace, remote_path: str, local_path: Path) -> None:
+    run_checked([
+        "scp",
+        "-o",
+        "StrictHostKeyChecking=no",
+        f"{args.robot_scp_host}:{remote_path}",
+        str(local_path),
+    ])
+
+
+def scp_to_robot(args: argparse.Namespace, local_path: Path, remote_path: str) -> None:
+    run_checked([
+        "scp",
+        "-o",
+        "StrictHostKeyChecking=no",
+        str(local_path),
+        f"{args.robot_scp_host}:{remote_path}",
+    ])
+
+
+def pack_upload_via_local_relay(args: argparse.Namespace, ac_version: str) -> dict:
+    if not args.source_dirs:
+        raise ValueError("relay upload requires explicit --source-dirs")
+    if len(args.source_dirs) != 1:
+        raise ValueError("relay upload currently supports exactly one --source-dirs entry")
+
+    ts = args.timestamp or timestamp_now()
+    merged_name = args.dataset_name or f"{sanitize_name(ac_version)}_{ts}"
+    repo_id = args.dataset_repo_id or f"{args.dataset_namespace}/{merged_name}"
+    local_root = Path(tempfile.mkdtemp(prefix="rlt-online-relay-"))
+    local_archive = local_root / f"{sanitize_name(merged_name)}.tgz"
+    dataset_root = local_root / "dataset"
+    remote_archive = f"/tmp/{sanitize_name(merged_name)}.tgz"
+    source_dir = args.source_dirs[0]
+
+    tar_cmd = " && ".join([
+        f"rm -f {shlex.quote(remote_archive)}",
+        f"tar -C {shlex.quote(source_dir)} -czf {shlex.quote(remote_archive)} .",
+        f"ls -lh {shlex.quote(remote_archive)}",
+    ])
+    run_capture([args.ssh_connect, args.robot_alias, "--cmd", tar_cmd], timeout_s=args.robot_relay_timeout_s)
+    scp_from_robot(args, remote_archive, local_archive)
+    dataset_root.mkdir(parents=True, exist_ok=True)
+    run_checked(["tar", "-C", str(dataset_root), "-xzf", str(local_archive)])
+    upload_private_dataset(dataset_root, repo_id)
+    total_eps, total_frames = summarize_dataset(dataset_root)
+    result = PackResult(repo_id, str(dataset_root), merged_name, ac_version, total_eps, total_frames)
+    emit_result(result)
+    return asdict(result)
+
+
+def upload_dataset_for_cycle(
+    args: argparse.Namespace,
+    payload: dict,
+    ac_version: str,
+) -> dict:
+    if args.robot_upload_mode == "relay":
+        return pack_upload_via_local_relay(args, ac_version)
+
+    pack_cmd = robot_upload_command(args.robot_python, payload)
+    try:
+        stdout = run_capture(
+            [args.ssh_connect, args.robot_alias, "--cmd", pack_cmd],
+            timeout_s=args.robot_upload_timeout_s,
+        )
+        return parse_result(stdout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        if args.robot_upload_mode == "hf":
+            raise
+        print(f"[cycle] robot HF upload failed; using local relay: {exc}", flush=True)
+        return pack_upload_via_local_relay(args, ac_version)
+
+
+def deploy_ac_via_local_relay(args: argparse.Namespace, train: dict) -> dict:
+    checkpoint_hf_path = train["checkpoint_hf_path"]
+    ac_version = train["ac_version"]
+    ac_ref = ACRef(version=ac_version, hf_path=checkpoint_hf_path)
+    local_ckpt = download_ac_checkpoint(args.model_repo, ac_ref)
+    remote_ckpt = f"/tmp/rlt_online_{sanitize_name(ac_version)}_rl_checkpoint.pt"
+    scp_to_robot(args, local_ckpt, remote_ckpt)
+    deploy_payload = {
+        "model_repo": args.model_repo,
+        "base_ac_file": args.base_ac_file,
+        "checkpoint_hf_path": checkpoint_hf_path,
+        "ac_version": ac_version,
+        "local_checkpoint_path": remote_ckpt,
+        "deploy_dir": args.robot_deploy_dir,
+        "latest_symlink": args.robot_latest_symlink,
+    }
+    deploy_cmd = robot_deploy_command(args.robot_python, deploy_payload)
+    stdout = run_capture(
+        [args.ssh_connect, args.robot_alias, "--cmd", deploy_cmd],
+        timeout_s=args.robot_deploy_timeout_s,
+    )
+    return parse_result(stdout)
+
+
+def deploy_ac_for_cycle(args: argparse.Namespace, train: dict) -> dict:
+    if args.robot_deploy_mode == "relay":
+        return deploy_ac_via_local_relay(args, train)
+
+    deploy_payload = {
+        "model_repo": args.model_repo,
+        "base_ac_file": args.base_ac_file,
+        "checkpoint_hf_path": train["checkpoint_hf_path"],
+        "deploy_dir": args.robot_deploy_dir,
+        "latest_symlink": args.robot_latest_symlink,
+    }
+    deploy_cmd = robot_deploy_command(args.robot_python, deploy_payload)
+    try:
+        stdout = run_capture(
+            [args.ssh_connect, args.robot_alias, "--cmd", deploy_cmd],
+            timeout_s=args.robot_deploy_timeout_s,
+        )
+        return parse_result(stdout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        if args.robot_deploy_mode == "hf":
+            raise
+        print(f"[cycle] robot HF deploy failed; using local relay: {exc}", flush=True)
+        return deploy_ac_via_local_relay(args, train)
+
+
 def remote_command(repo: str, python_bin: str, role_args: list[str]) -> str:
     script = Path(repo) / "scripts" / "rlt_online_cycle.py"
     parts = ["cd", shlex.quote(repo), "&&", shlex.quote(python_bin), shlex.quote(str(script))]
@@ -700,9 +835,7 @@ def command_cycle(args: argparse.Namespace) -> None:
         "timestamp": args.timestamp,
         "task": args.task,
     }
-    pack_cmd = robot_upload_command(args.robot_python, upload_payload)
-    pack_stdout = run_capture([args.ssh_connect, args.robot_alias, "--cmd", pack_cmd])
-    pack = parse_result(pack_stdout)
+    pack = upload_dataset_for_cycle(args, upload_payload, effective_ac_version)
 
     train_args = [
         "train-upload",
@@ -723,17 +856,7 @@ def command_cycle(args: argparse.Namespace) -> None:
     train_cmd = remote_command(args.coder_b_repo, args.coder_b_python, train_args)
     train_stdout = run_capture([args.coder_connect, args.coder_alias, "--cmd", train_cmd])
     train = parse_result(train_stdout)
-
-    deploy_payload = {
-        "model_repo": args.model_repo,
-        "base_ac_file": args.base_ac_file,
-        "checkpoint_hf_path": train["checkpoint_hf_path"],
-        "deploy_dir": args.robot_deploy_dir,
-        "latest_symlink": args.robot_latest_symlink,
-    }
-    deploy_cmd = robot_deploy_command(args.robot_python, deploy_payload)
-    deploy_stdout = run_capture([args.ssh_connect, args.robot_alias, "--cmd", deploy_cmd])
-    deploy = parse_result(deploy_stdout)
+    deploy = deploy_ac_for_cycle(args, train)
     print(json.dumps({"pack": pack, "train": train, "deploy": deploy}, indent=2, sort_keys=True))
 
 def add_common_model_args(parser: argparse.ArgumentParser) -> None:
@@ -831,6 +954,22 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--robot-merged-root", default="~/.cache/rlt_online/merged")
     cycle.add_argument("--robot-deploy-dir", default="~/rlt_online/ac_checkpoints")
     cycle.add_argument("--robot-latest-symlink", default="~/rlt_online/latest_rl_checkpoint.pt")
+    cycle.add_argument("--robot-scp-host", default="kye@100.70.170.56")
+    cycle.add_argument(
+        "--robot-upload-mode",
+        choices=["auto", "hf", "relay"],
+        default="auto",
+        help="Use c->HF directly, local relay only, or auto fallback.",
+    )
+    cycle.add_argument(
+        "--robot-deploy-mode",
+        choices=["auto", "hf", "relay"],
+        default="auto",
+        help="Use c<-HF directly, local relay only, or auto fallback.",
+    )
+    cycle.add_argument("--robot-upload-timeout-s", type=int, default=90)
+    cycle.add_argument("--robot-deploy-timeout-s", type=int, default=120)
+    cycle.add_argument("--robot-relay-timeout-s", type=int, default=600)
     cycle.set_defaults(func=command_cycle)
     return parser
 
