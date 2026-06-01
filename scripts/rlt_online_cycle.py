@@ -936,7 +936,7 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--dataset-repo-id", default=None)
     cycle.add_argument("--source-dirs", nargs="*", default=[])
     cycle.add_argument("--source-prefix", action="append", default=["eval_rlt_hil_"])
-    cycle.add_argument("--max-datasets", type=int, default=8)
+    cycle.add_argument("--max-datasets", type=int, default=1)
     cycle.add_argument("--transition-passes", type=float, default=2.0)
     cycle.add_argument("--gradient-steps", type=int, default=200)
     cycle.add_argument("--batch-size", type=int, default=64)
