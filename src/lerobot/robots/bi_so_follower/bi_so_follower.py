@@ -61,6 +61,8 @@ class BiSOFollower(Robot):
 
         self.left_arm = SOFollower(left_arm_config)
         self.right_arm = SOFollower(right_arm_config)
+        self.left_arm.diagnostic_label = "left follower arm"
+        self.right_arm.diagnostic_label = "right follower arm"
 
         # Only for compatibility with other parts of the codebase that expect a `robot.cameras` attribute
         self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}

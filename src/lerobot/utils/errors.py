@@ -30,3 +30,29 @@ class DeviceAlreadyConnectedError(ConnectionError):
     ):
         self.message = message
         super().__init__(self.message)
+
+
+def _serial_from_port(port: str) -> str:
+    port_name = port.rsplit("/", 1)[-1]
+    if "-if" not in port_name or "_" not in port_name:
+        return port
+
+    return port_name.split("-if", 1)[0].rsplit("_", 1)[-1]
+
+
+class DeviceDroppedConnectionError(ConnectionError):
+    """Exception raised when an already-connected device stops responding."""
+
+    def __init__(
+        self,
+        device_label: str,
+        port: str,
+        operation: str,
+        cause: ConnectionError,
+    ):
+        serial = _serial_from_port(port)
+        self.message = (
+            f"{device_label} dropped offline while {operation} "
+            f"(serial={serial}, port={port}): {cause}"
+        )
+        super().__init__(self.message)

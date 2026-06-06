@@ -119,6 +119,20 @@ def test_get_observation(follower):
         assert obs[f"{motor}.pos"] == idx
 
 
+def test_get_observation_connection_error_has_arm_context(follower):
+    follower.connect()
+    follower.diagnostic_label = "right follower arm"
+    follower.bus.sync_read.side_effect = ConnectionError("raw bus failure")
+
+    with pytest.raises(ConnectionError) as exc_info:
+        follower.get_observation()
+
+    message = str(exc_info.value)
+    assert "right follower arm dropped offline while reading follower observation" in message
+    assert "serial=/dev/null, port=/dev/null" in message
+    assert "raw bus failure" in message
+
+
 def test_send_action(follower):
     follower.connect()
 

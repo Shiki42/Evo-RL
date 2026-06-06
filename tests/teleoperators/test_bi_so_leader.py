@@ -59,6 +59,13 @@ def bi_leader():
         yield teleop, left_arm, right_arm
 
 
+def test_init_sets_arm_diagnostic_labels(bi_leader):
+    _, left_arm, right_arm = bi_leader
+
+    assert left_arm.diagnostic_label == "left leader arm"
+    assert right_arm.diagnostic_label == "right leader arm"
+
+
 def test_set_manual_control_requires_connection(bi_leader):
     teleop, _, _ = bi_leader
 

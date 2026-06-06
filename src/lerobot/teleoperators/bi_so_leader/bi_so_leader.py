@@ -53,6 +53,8 @@ class BiSOLeader(Teleoperator):
 
         self.left_arm = SOLeader(left_arm_config)
         self.right_arm = SOLeader(right_arm_config)
+        self.left_arm.diagnostic_label = "left leader arm"
+        self.right_arm.diagnostic_label = "right leader arm"
 
     @cached_property
     def action_features(self) -> dict[str, type]:

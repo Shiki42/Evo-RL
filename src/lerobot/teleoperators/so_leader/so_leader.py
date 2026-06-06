@@ -24,6 +24,7 @@ from lerobot.motors.feetech import (
     OperatingMode,
 )
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.errors import DeviceDroppedConnectionError
 
 from ..teleoperator import Teleoperator
 from .config_so_leader import SOLeaderTeleopConfig
@@ -54,6 +55,7 @@ class SOLeader(Teleoperator):
             },
             calibration=self.calibration,
         )
+        self.diagnostic_label = "leader arm"
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -150,12 +152,12 @@ class SOLeader(Teleoperator):
     def set_manual_control(self, enabled: bool) -> None:
         if enabled:
             if not self._manual_control_enabled:
-                self.bus.disable_torque()
+                self._disable_torque("enabling leader manual control")
                 self._manual_control_enabled = True
             return
 
         if self._manual_control_enabled:
-            self.bus.enable_torque()
+            self._enable_torque("disabling leader manual control")
             self._manual_control_enabled = False
 
     def setup_motors(self) -> None:
@@ -164,10 +166,31 @@ class SOLeader(Teleoperator):
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
 
+    def _raise_connection_error(self, operation: str, exc: ConnectionError) -> None:
+        raise DeviceDroppedConnectionError(self.diagnostic_label, self.config.port, operation, exc) from exc
+
+    def _read_present_position(self, operation: str) -> dict[str, float]:
+        try:
+            return self.bus.sync_read("Present_Position")
+        except ConnectionError as exc:
+            self._raise_connection_error(operation, exc)
+
+    def _disable_torque(self, operation: str) -> None:
+        try:
+            self.bus.disable_torque()
+        except ConnectionError as exc:
+            self._raise_connection_error(operation, exc)
+
+    def _enable_torque(self, operation: str) -> None:
+        try:
+            self.bus.enable_torque()
+        except ConnectionError as exc:
+            self._raise_connection_error(operation, exc)
+
     @check_if_not_connected
     def get_action(self) -> dict[str, float]:
         start = time.perf_counter()
-        action = self.bus.sync_read("Present_Position")
+        action = self._read_present_position("reading leader action")
         action = {f"{motor}.pos": val for motor, val in action.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")
@@ -181,7 +204,11 @@ class SOLeader(Teleoperator):
         goal_pos = {key.removesuffix(".pos"): val for key, val in feedback.items() if key.endswith(".pos")}
         if not goal_pos:
             return
-        self.bus.sync_write("Goal_Position", goal_pos)
+
+        try:
+            self.bus.sync_write("Goal_Position", goal_pos)
+        except ConnectionError as exc:
+            self._raise_connection_error("sending leader feedback goal position", exc)
 
     @check_if_not_connected
     def disconnect(self) -> None:

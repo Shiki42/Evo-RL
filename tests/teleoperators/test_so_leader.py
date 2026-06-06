@@ -105,6 +105,34 @@ def test_get_action(leader):
     assert set(action.keys()) == expected_keys
 
 
+def test_get_action_connection_error_has_arm_context(leader):
+    leader.connect()
+    leader.diagnostic_label = "left leader arm"
+    leader.bus.sync_read.side_effect = ConnectionError("raw bus failure")
+
+    with pytest.raises(ConnectionError) as exc_info:
+        leader.get_action()
+
+    message = str(exc_info.value)
+    assert "left leader arm dropped offline while reading leader action" in message
+    assert "serial=/dev/null, port=/dev/null" in message
+    assert "raw bus failure" in message
+
+
+def test_set_manual_control_connection_error_has_arm_context(leader):
+    leader.connect()
+    leader.diagnostic_label = "right leader arm"
+    leader.bus.enable_torque.side_effect = ConnectionError("raw bus failure")
+
+    with pytest.raises(ConnectionError) as exc_info:
+        leader.set_manual_control(False)
+
+    message = str(exc_info.value)
+    assert "right leader arm dropped offline while disabling leader manual control" in message
+    assert "serial=/dev/null, port=/dev/null" in message
+    assert "raw bus failure" in message
+
+
 def test_send_feedback(leader):
     leader.connect()
     feedback = {f"{m}.pos": i * 10 for i, m in enumerate(leader.bus.motors, 1)}
