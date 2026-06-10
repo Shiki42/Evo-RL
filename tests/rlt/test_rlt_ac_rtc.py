@@ -16,6 +16,8 @@ def _make_policy(chunk: torch.Tensor | None = None) -> ChunkACPolicy:
     policy = object.__new__(ChunkACPolicy)
     rtc_config = RTCConfig(enabled=True, execution_horizon=2)
     policy._rtc_config = rtc_config
+    policy._vla_rtc_config = rtc_config
+    policy._active_pi05_rtc_config = None
     policy._rtc_action_queue = ActionQueue(rtc_config)
     policy._rtc_latency_tracker = LatencyTracker()
     policy._rtc_fps = 10.0
@@ -111,3 +113,17 @@ def test_reset_rtc_runtime_invalidates_inflight_request_without_joining() -> Non
     assert policy._rtc_action_queue.qsize() == 0
     assert len(policy._rtc_step_metadata) == 0
     assert policy.predict_calls == []
+
+
+def test_rtc_config_for_phase_uses_vla_horizon_only_outside_rl_phase() -> None:
+    policy = _make_policy()
+    rlt_config = RTCConfig(enabled=True, execution_horizon=10)
+    vla_config = RTCConfig(enabled=True, execution_horizon=25)
+    policy._rtc_config = rlt_config
+    policy._vla_rtc_config = vla_config
+
+    modifier = type("_Modifier", (), {"is_rl_phase": False})()
+    assert policy._rtc_config_for_phase(modifier).execution_horizon == 25
+
+    modifier.is_rl_phase = True
+    assert policy._rtc_config_for_phase(modifier).execution_horizon == 10

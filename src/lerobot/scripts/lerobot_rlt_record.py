@@ -245,6 +245,7 @@ class RLTRecordConfig:
     # scripts keep the synchronous chunk queue.
     rtc_enabled: bool = False
     rtc_execution_horizon: int = 10
+    vla_rtc_execution_horizon: int | None = None
     rtc_max_guidance_weight: float = 10.0
     rtc_prefix_attention_schedule: str = "EXP"
     rtc_action_queue_size_to_get_new_actions: int | None = None
@@ -593,16 +594,29 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         cfg.rlt.rtc_prefix_attention_schedule
                     ),
                 )
+                vla_rtc_config = None
+                if cfg.rlt.vla_rtc_execution_horizon is not None:
+                    vla_rtc_config = RTCConfig(
+                        enabled=True,
+                        execution_horizon=cfg.rlt.vla_rtc_execution_horizon,
+                        max_guidance_weight=cfg.rlt.rtc_max_guidance_weight,
+                        prefix_attention_schedule=RTCAttentionSchedule(
+                            cfg.rlt.rtc_prefix_attention_schedule
+                        ),
+                    )
                 policy.configure_rtc(
                     rtc_config,
                     fps=cfg.dataset.fps,
                     action_queue_size_to_get_new_actions=(
                         cfg.rlt.rtc_action_queue_size_to_get_new_actions
                     ),
+                    vla_rtc_config=vla_rtc_config,
                 )
                 logging.info(
-                    "rlt_ac RTC enabled: horizon=%d guidance=%.3f schedule=%s refill_threshold=%s",
+                    "rlt_ac RTC enabled: rlt_horizon=%d vla_horizon=%d guidance=%.3f "
+                    "schedule=%s refill_threshold=%s",
                     cfg.rlt.rtc_execution_horizon,
+                    cfg.rlt.vla_rtc_execution_horizon or cfg.rlt.rtc_execution_horizon,
                     cfg.rlt.rtc_max_guidance_weight,
                     cfg.rlt.rtc_prefix_attention_schedule,
                     cfg.rlt.rtc_action_queue_size_to_get_new_actions,
